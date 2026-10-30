@@ -1,0 +1,752 @@
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -229,6 +229,7 @@
+     VLLM_B12X_MLA_CKV_GATHER: bool = False
+     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
+     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
++    VLLM_B12X_MLA_CKV_GATHER_MIXED: bool = False
+     VLLM_B12X_PAGED_DECODE: Literal["auto", "0", "1"] = "auto"
+     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk", "shared"] | None = None
+     VLLM_PLE_SHARED_TABLE_DIR: str = "/dev/shm/vllm-ple"
+@@ -1921,6 +1922,12 @@
+     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
+         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+     ),
++    # Mixed GLM DSA batches gather the full CKV cache for their prefill rows
++    # only; their decode rows keep the query exchange and LSE combine.
++    "VLLM_B12X_MLA_CKV_GATHER_MIXED": lambda: (
++        os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIXED", "0").lower()
++        in ("1", "true", "yes", "on")
++    ),
+     # B12X attention decode/verify through b12x.attention.paged_decode:
+     # "auto" for layers with unequal Q/K and V head dims and for non-causal
+     # FP8-KV layers, "1" for every supported layer, "0" never.
+--- a/vllm/models/deepseek_v32/attention.py
++++ b/vllm/models/deepseek_v32/attention.py
+@@ -512,6 +512,54 @@
+         )
+         return self.o_proj(output)[0]
+ 
++    def _split_ckv_dcp_mqa(
++        self,
++        mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        kv_cache: torch.Tensor,
++        attn_metadata,
++        num_actual: int,
++    ) -> torch.Tensor:
++        """Attend a mixed DCP batch in two parts.
++
++        Decode rows (ordered first) exchange their queries and merge LSE
++        across the DCP group; prefill rows attend with their local heads over
++        the gathered cache of their own requests, which moves far fewer bytes
++        than exchanging every head's queries and outputs.
++        """
++        assert self.dcp_manager is not None
++        assert self.dcp_manager.query_gather is not None
++        num_decode = int(attn_metadata.num_decode_tokens)
++        if isinstance(mqa_q_arg, tuple):
++            mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
++            prefill_q = mqa_q_arg[num_decode:num_actual]
++        else:
++            # The packed query may alias the kernel workspace both calls use.
++            prefill_q = mqa_q_arg[num_decode:num_actual].clone()
++        decode_q = self.dcp_manager.query_gather(mqa_q_arg[:num_decode])
++        decode_out, decode_lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
++            decode_q, kv_cache, attn_metadata, self, route="extend"
++        )
++        assert decode_lse is not None
++        decode_out = self.dcp_manager.combine(
++            decode_out, decode_lse, seq_lens=None, query_start_loc=None
++        )
++        attn_out = torch.empty(
++            (num_actual, *decode_out.shape[1:]),
++            dtype=decode_out.dtype,
++            device=decode_out.device,
++        )
++        attn_out[:num_decode].copy_(decode_out)
++        prefill_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
++            prefill_q,
++            kv_cache,
++            attn_metadata,
++            self,
++            row_start=num_decode,
++            route="ckv_extend",
++        )
++        attn_out[num_decode:].copy_(prefill_out)
++        return attn_out
++
+     @eager_break_during_capture
+     def _sparse_indexer_and_attn(
+         self,
+@@ -627,61 +675,73 @@
+                 attn_metadata, num_actual
+             )
+         )
+-        if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
+-            if isinstance(mqa_q_arg, tuple):
+-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+-            mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
+-        elif not self.use_pcp and self.impl.dcp_world_size > 1 and not full_ckv_dcp:
+-            assert self.dcp_manager is not None
+-            if isinstance(mqa_q_arg, tuple):
+-                mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
+-            assert self.dcp_manager.query_gather is not None
+-            mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
+-        attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+-            mqa_q_arg, kv_cache, attn_metadata, self
+-        )
+-
+-        if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
+-            assert lse is not None and self.dcp_manager is not None
+-            seq_lens: torch.Tensor | None
+-            query_start_loc: torch.Tensor | None
+-            if self.use_pcp:
+-                decode_metadata = getattr(attn_metadata, "decode", None)
+-                if decode_metadata is not None:
+-                    seq_lens = decode_metadata.seq_lens
++        split_ckv_dcp = (
++            not self.use_pcp
++            and not full_ckv_dcp
++            and self.impl.dcp_world_size > 1
++            and hasattr(self.impl, "uses_split_ckv_dcp")
++            and self.impl.uses_split_ckv_dcp(attn_metadata, num_actual)
++        )
++        if split_ckv_dcp:
++            attn_out = self._split_ckv_dcp_mqa(
++                mqa_q_arg, kv_cache, attn_metadata, num_actual
++            )
++        else:
++            if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
++                if isinstance(mqa_q_arg, tuple):
++                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
++                mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
++            elif not self.use_pcp and self.impl.dcp_world_size > 1 and not full_ckv_dcp:
++                assert self.dcp_manager is not None
++                if isinstance(mqa_q_arg, tuple):
++                    mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
++                assert self.dcp_manager.query_gather is not None
++                mqa_q_arg = self.dcp_manager.query_gather(mqa_q_arg)
++            attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
++                mqa_q_arg, kv_cache, attn_metadata, self
++            )
++
++            if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
++                assert lse is not None and self.dcp_manager is not None
++                seq_lens: torch.Tensor | None
++                query_start_loc: torch.Tensor | None
++                if self.use_pcp:
++                    decode_metadata = getattr(attn_metadata, "decode", None)
++                    if decode_metadata is not None:
++                        seq_lens = decode_metadata.seq_lens
++                    else:
++                        all_seq_lens = cast(
++                            torch.Tensor,
++                            attn_metadata.seq_lens,  # type: ignore[attr-defined]
++                        )
++                        seq_lens = all_seq_lens[: attn_metadata.num_decodes]
++                    query_start_loc = attn_metadata.query_start_loc[
++                        : attn_metadata.num_decodes + 1
++                    ]
+                 else:
+-                    all_seq_lens = cast(
+-                        torch.Tensor,
+-                        attn_metadata.seq_lens,  # type: ignore[attr-defined]
++                    # The backend emits (0, -inf) for empty local shards, so no
++                    # PCP-only empty-shard metadata is needed.
++                    seq_lens = None
++                    query_start_loc = None
++                # Under PCP+DCP the prefill rows attended over the gathered KV, so
++                # only the decode rows carry an LSE and take part in the merge.
++                num_merge_rows = lse.shape[0]
++                if num_merge_rows == attn_out.shape[0]:
++                    attn_out = self.dcp_manager.combine(
++                        attn_out,
++                        lse,
++                        seq_lens=seq_lens,  # type: ignore[arg-type]
++                        query_start_loc=query_start_loc,  # type: ignore[arg-type]
+                     )
+-                    seq_lens = all_seq_lens[: attn_metadata.num_decodes]
+-                query_start_loc = attn_metadata.query_start_loc[
+-                    : attn_metadata.num_decodes + 1
+-                ]
+-            else:
+-                # The backend emits (0, -inf) for empty local shards, so no
+-                # PCP-only empty-shard metadata is needed.
+-                seq_lens = None
+-                query_start_loc = None
+-            # Under PCP+DCP the prefill rows attended over the gathered KV, so
+-            # only the decode rows carry an LSE and take part in the merge.
+-            num_merge_rows = lse.shape[0]
+-            if num_merge_rows == attn_out.shape[0]:
+-                attn_out = self.dcp_manager.combine(
+-                    attn_out,
+-                    lse,
+-                    seq_lens=seq_lens,  # type: ignore[arg-type]
+-                    query_start_loc=query_start_loc,  # type: ignore[arg-type]
+-                )
+-            elif num_merge_rows > 0:
+-                attn_out[:num_merge_rows] = self.dcp_manager.combine(
+-                    attn_out[:num_merge_rows],
+-                    lse,
+-                    seq_lens=seq_lens,  # type: ignore[arg-type]
+-                    query_start_loc=query_start_loc,  # type: ignore[arg-type]
+-                )
+-            if self.use_pcp:
+-                attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
++                elif num_merge_rows > 0:
++                    attn_out[:num_merge_rows] = self.dcp_manager.combine(
++                        attn_out[:num_merge_rows],
++                        lse,
++                        seq_lens=seq_lens,  # type: ignore[arg-type]
++                        query_start_loc=query_start_loc,  # type: ignore[arg-type]
++                    )
++                if self.use_pcp:
++                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+ 
+         # NOTE(woosuk): While the below does not need to be in the eager region,
+         # we put it here to avoid copying the attention output. Move this back to the
+--- a/vllm/models/deepseek_v32/nvidia/mtp.py
++++ b/vllm/models/deepseek_v32/nvidia/mtp.py
+@@ -46,6 +46,10 @@
+     sp_shard,
+ )
+ from vllm.models.deepseek_v32.common.kernels import fused_eh_norm
++from vllm.models.glm5next.nvidia.mtp_draft_head import (
++    QuantizedDraftHead,
++    make_quantized_draft_head,
++)
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backends.mla.index_group import (
+@@ -192,6 +196,21 @@
+         # A full on-rank table lets the eh_norm fusion fold in the embedding gather.
+         self.replicated_embed = has_full_vocab_on_rank(self.embed_tokens)
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.quantized_draft_head: QuantizedDraftHead | None = None
++
++    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
++        """Build the draft-only copy of the shared target head that
++        ``VLLM_GLM53_MTP_DRAFT_HEAD`` selects; the verifier keeps its head.
++
++        A runtime-quantized target head is already packed and drafts as is.
++        """
++        if getattr(source_head, "runtime_lm_head_quantization", None) in (
++            "nvfp4",
++            "mxfp8",
++        ):
++            self.quantized_draft_head = None
++            return
++        self.quantized_draft_head = make_quantized_draft_head(source_head)
+ 
+     def set_skip_topk(self, skip: bool):
+         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
+@@ -248,7 +267,8 @@
+         # hidden_states is already post-final-norm (produced in the layer
+         # forward and recycled as-is); apply the LM head only, without a
+         # second RMSNorm.
+-        return self.logits_processor(mtp_layer.shared_head.head, hidden_states)
++        head = self.quantized_draft_head or mtp_layer.shared_head.head
++        return self.logits_processor(head, hidden_states)
+ 
+     def get_top_tokens(
+         self,
+@@ -263,9 +283,8 @@
+         """
+         current_step_idx = spec_step_idx % self.num_mtp_layers
+         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+-        return self.logits_processor.get_top_tokens(
+-            mtp_layer.shared_head.head, hidden_states
+-        )
++        head = self.quantized_draft_head or mtp_layer.shared_head.head
++        return self.logits_processor.get_top_tokens(head, hidden_states)
+ 
+ 
+ class DeepseekV32MTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+@@ -343,6 +362,10 @@
+         """See ``DeepseekV32MultiTokenPredictor.get_top_tokens``."""
+         return self.model.get_top_tokens(hidden_states, spec_step_idx)
+ 
++    def prepare_draft_lm_head(self, source_head: nn.Module) -> None:
++        """Create a draft-only quantized copy of the shared target head."""
++        self.model.prepare_draft_lm_head(source_head)
++
+     def _rewrite_spec_layer_name(self, spec_layer: int, name: str) -> str:
+         spec_layer_weight_names = [
+             "embed_tokens",
+--- a/vllm/models/glm5next/nvidia/mtp_draft_head.py
++++ b/vllm/models/glm5next/nvidia/mtp_draft_head.py
+@@ -27,6 +27,7 @@
+ logger = init_logger(__name__)
+ 
+ _NVFP4_GLOBAL_MAX = 448.0 * 6.0
++_CUTE_DSL_N_TILE = 64
+ _SUPPORTED_MODES = frozenset(("bf16", "nvfp4"))
+ 
+ 
+@@ -103,6 +104,15 @@
+             )
+         import flashinfer
+ 
++        # The CuTe-DSL W4A16 GEMM packs N in tiles of 64; a vocabulary shard
++        # that is not a multiple (GLM-5.3 at TP8: 154880 / 8 = 19360) is
++        # padded with zero rows whose logits forward() drops.
++        self.output_rows = int(weight.shape[0])
++        padded_rows = -(-self.output_rows // _CUTE_DSL_N_TILE) * _CUTE_DSL_N_TILE
++        if padded_rows != self.output_rows:
++            weight = torch.nn.functional.pad(
++                weight, (0, 0, 0, padded_rows - self.output_rows)
++            )
+         weight_global_scale = _nvfp4_weight_global_scale(weight)
+         weight_fp4, weight_sf = flashinfer.nvfp4_quantize(
+             weight,
+@@ -143,6 +153,8 @@
+             backend="cute-dsl",
+             out_dtype=hidden.dtype,
+         )
++        if logits.shape[-1] != self.output_rows:
++            logits = logits[:, : self.output_rows].contiguous()
+         return logits.reshape(*shape[:-1], -1)
+ 
+ 
+--- a/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+@@ -247,6 +247,36 @@
+     )
+ 
+ 
++def _use_b12x_split_ckv_gather(
++    *,
++    enabled: bool,
++    is_sparse_glm: bool,
++    dcp_world_size: int,
++    num_decode_tokens: int,
++    num_prefills: int,
++    num_prefill_tokens: int,
++    min_tokens: int,
++    max_tokens: int,
++) -> bool:
++    """Whether a mixed batch gathers the full CKV cache for its prefill rows.
++
++    Decode rows attend a few query tokens over long contexts, so they keep
++    the query exchange; the prefill rows of the same batch gather the cache
++    of their own requests instead of exchanging every head's queries.
++    Both sparse GLM families qualify: GLM DSA (``glm_moe_dsa``) and GLM5Next
++    (``glm5_next``), whose eager prefill already runs the same gather.
++    """
++    return (
++        enabled
++        and is_sparse_glm
++        and dcp_world_size > 1
++        and num_decode_tokens > 0
++        and num_prefills > 0
++        and num_prefill_tokens > min_tokens
++        and num_prefill_tokens <= max_tokens
++    )
++
++
+ def _ckv_rank_token_alignment(page_size: int, dcp_world_size: int) -> int:
+     """Per-rank padding that makes the gathered CKV page-addressable.
+ 
+@@ -703,6 +733,7 @@
+     dcp_local_total_tokens: int = 0
+     dcp_padded_total_tokens: int = 0
+     dcp_ckv_gather_eligible: bool = False
++    dcp_ckv_split_eligible: bool = False
+ 
+ 
+ class B12xMLASparseMetadataBuilder(
+@@ -712,6 +743,7 @@
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+     requires_glm_next_selector_metadata: bool
+     _is_glm_dsa: bool = False
++    _ckv_split_requested: bool = False
+ 
+     def __init__(
+         self,
+@@ -760,6 +792,11 @@
+             and self.dcp_world_size > 1
+             and envs.VLLM_B12X_MLA_CKV_GATHER
+         )
++        self._ckv_split_requested = (
++            self._ckv_gather_requested
++            and (self._is_glm_dsa or self.requires_glm_next_selector_metadata)
++            and envs.VLLM_B12X_MLA_CKV_GATHER_MIXED
++        )
+         if self._ckv_gather_requested:
+             # GLM DSA selects index_topk tokens; GLM5Next appends its
+             # incomplete-pool tail to the selection.
+@@ -976,7 +1013,7 @@
+             metadata.prefill_seq_lens_cpu = seq_lens_cpu_source[
+                 prefill_start : prefill_start + metadata.num_prefills
+             ].clone()
+-        if _use_b12x_full_ckv_gather(
++        full_ckv = _use_b12x_full_ckv_gather(
+             enabled=self._ckv_gather_requested,
+             is_glm_next=self.requires_glm_next_selector_metadata,
+             # GLM DSA gathers only in eager prefill: captured graphs and
+@@ -989,15 +1026,35 @@
+             num_decode_tokens=metadata.num_decode_tokens,
+             min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
+             max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
+-        ):
++        )
++        split_ckv = not full_ckv and _use_b12x_split_ckv_gather(
++            enabled=self._ckv_split_requested,
++            is_sparse_glm=(
++                self._is_glm_dsa or self.requires_glm_next_selector_metadata
++            )
++            and not for_cudagraph_capture,
++            dcp_world_size=self.dcp_world_size,
++            num_decode_tokens=metadata.num_decode_tokens,
++            num_prefills=metadata.num_prefills,
++            num_prefill_tokens=num_tokens - metadata.num_decode_tokens,
++            min_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS,
++            max_tokens=envs.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS,
++        )
++        if full_ckv or split_ckv:
+             assert self.ckv_selected_indices_buffer is not None
+             assert self.ckv_active_counts_buffer is not None
+             assert self.dcp_rank_req_lens_buffer is not None
+             assert self.dcp_rank_req_starts_buffer is not None
+             assert self.dcp_local_cu_seq_lens_buffer is not None
+             global_seq_lens = common.seq_lens[: common.num_reqs]
++            gather_seq_lens = global_seq_lens
++            if split_ckv:
++                # The decode requests (ordered first) keep the query exchange,
++                # so none of their cache is gathered.
++                gather_seq_lens = global_seq_lens.clone()
++                gather_seq_lens[: metadata.num_decodes] = 0
+             all_rank_lens = get_dcp_local_seq_lens(
+-                global_seq_lens,
++                gather_seq_lens,
+                 self.dcp_world_size,
+                 dcp_rank=None,
+                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+@@ -1045,7 +1102,8 @@
+                 metadata.global_cache_seq_lens_per_req = global_seq_lens
+                 metadata.dcp_local_total_tokens = local_total_tokens
+                 metadata.dcp_padded_total_tokens = padded_total_tokens
+-                metadata.dcp_ckv_gather_eligible = True
++                metadata.dcp_ckv_gather_eligible = full_ckv
++                metadata.dcp_ckv_split_eligible = split_ckv
+         (
+             metadata.selector_state_slot_ids,
+             metadata.selector_state_is_fresh,
+@@ -1943,18 +2001,10 @@
+             kv_c_normed, kv_cache, slot_mapping.flatten(), plan=plan
+         )
+ 
+-    def uses_full_ckv_dcp(
+-        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
+-    ) -> bool:
+-        # Decode layers ask once per step; reject them before the CUDA query.
+-        if not (self._ckv_gather_enabled and attn_metadata.dcp_ckv_gather_eligible):
+-            return False
+-        if torch.cuda.is_current_stream_capturing():
+-            return False
++    def _ckv_gather_ready(self, attn_metadata: B12xMLASparseMetadata) -> bool:
++        """Whether the builder staged a gather that fits the reserved cache."""
+         return (
+             self._kernel_page_size_finalized
+-            and attn_metadata.num_decode_tokens == 0
+-            and num_tokens == attn_metadata.num_actual_tokens
+             and 0 < attn_metadata.dcp_padded_total_tokens <= self._ckv_local_capacity
+             and attn_metadata.dcp_local_total_tokens
+             <= attn_metadata.dcp_padded_total_tokens
+@@ -1971,13 +2021,49 @@
+             )
+         )
+ 
++    def uses_full_ckv_dcp(
++        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
++    ) -> bool:
++        # Decode layers ask once per step; reject them before the CUDA query.
++        if not (self._ckv_gather_enabled and attn_metadata.dcp_ckv_gather_eligible):
++            return False
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        return (
++            attn_metadata.num_decode_tokens == 0
++            and num_tokens == attn_metadata.num_actual_tokens
++            and self._ckv_gather_ready(attn_metadata)
++        )
++
++    def uses_split_ckv_dcp(
++        self, attn_metadata: B12xMLASparseMetadata, num_tokens: int
++    ) -> bool:
++        """Whether a mixed batch runs its decode rows through the query
++        exchange and its prefill rows over their gathered full CKV cache."""
++        if not (
++            self._ckv_gather_enabled
++            and getattr(attn_metadata, "dcp_ckv_split_eligible", False)
++        ):
++            return False
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        return (
++            0 < int(attn_metadata.num_decode_tokens) < num_tokens
++            and num_tokens == attn_metadata.num_actual_tokens
++            and self._ckv_gather_ready(attn_metadata)
++        )
++
+     def _gather_full_ckv(
+         self,
+         kv_cache: torch.Tensor,
+         attn_metadata: B12xMLASparseMetadata,
+         gathered_buffer: torch.Tensor,
+     ) -> torch.Tensor:
+-        if not self.uses_full_ckv_dcp(attn_metadata, attn_metadata.num_actual_tokens):
++        num_actual = attn_metadata.num_actual_tokens
++        if not (
++            self.uses_full_ckv_dcp(attn_metadata, num_actual)
++            or self.uses_split_ckv_dcp(attn_metadata, num_actual)
++        ):
+             raise RuntimeError("full CKV gather called for an ineligible batch")
+         # A packed FP8 cache may arrive through an E4M3 view. The gather copies
+         # whole native records, including scales and the RoPE tail.
+@@ -2034,7 +2120,15 @@
+         kv_c_and_k_pe_cache: torch.Tensor,
+         attn_metadata: B12xMLASparseMetadata,
+         layer: AttentionLayer,
++        *,
++        row_start: int = 0,
++        route: str | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        """Attend the batch rows ``[row_start, row_start + len(q))``.
++
++        ``route`` forces the ``extend`` or ``ckv_extend`` plan for one part of
++        a split mixed batch; the whole-batch call chooses its own route.
++        """
+         del layer
+         cache_page_size = int(kv_c_and_k_pe_cache.shape[1])
+         metadata_page_size = int(attn_metadata.block_size)
+@@ -2048,7 +2142,13 @@
+                 f"plan={self._kernel_page_size}"
+             )
+         num_tokens = int(q[0].shape[0] if isinstance(q, tuple) else q.shape[0])
+-        plan_key = self._plan_key(attn_metadata, num_tokens)
++        row_end = row_start + num_tokens
++        if route is None:
++            plan_key = self._plan_key(attn_metadata, num_tokens)
++        else:
++            if route not in ("extend", "ckv_extend"):
++                raise ValueError(f"unsupported forced sparse MLA route {route!r}")
++            plan_key = (route, self._max_tokens)
+         plan = self._plan(plan_key)
+         use_ckv_gather = plan_key[0] == "ckv_extend"
+         if use_ckv_gather:
+@@ -2095,7 +2195,8 @@
+             )
+ 
+         assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_tokens]
++        topk_indices = self.topk_indices_buffer[row_start:row_end]
++        req_id_per_token = attn_metadata.req_id_per_token[row_start:row_end]
+         kv_cache_for_run = kv_c_and_k_pe_cache
+         if use_ckv_gather:
+             gathered_buffer = workspaces[2]
+@@ -2113,7 +2214,7 @@
+             ]
+             active_counts = attn_metadata.ckv_active_counts[:num_tokens]
+             _map_global_topk_to_gathered_ckv(
+-                attn_metadata.req_id_per_token[:num_tokens],
++                req_id_per_token,
+                 topk_indices,
+                 attn_metadata.dcp_rank_req_starts,
+                 attn_metadata.dcp_rank_req_lens,
+@@ -2128,8 +2229,8 @@
+                 attn_metadata.global_cache_seq_lens_per_req,
+                 attn_metadata.query_start_loc,
+                 attn_metadata.req_id_per_token,
+-                num_tokens,
+-            ).contiguous()
++                row_end,
++            )[row_start:].contiguous()
+             torch.minimum(active_counts, cache_seq_lens, out=active_counts)
+             _mask_page_table_after_nsa_len(selected_indices, active_counts)
+         else:
+@@ -2150,7 +2251,7 @@
+                     block_size=attn_metadata.block_size,
+                 )
+                 selected_indices, active_counts = triton_filter_and_convert_dcp_index(
+-                    attn_metadata.req_id_per_token[:num_tokens],
++                    req_id_per_token,
+                     attn_metadata.block_table,
+                     topk_indices,
+                     dcp_size=self.dcp_world_size,
+@@ -2175,7 +2276,7 @@
+                 )
+                 selected_indices, active_counts = (
+                     triton_convert_req_index_to_global_index(
+-                        attn_metadata.req_id_per_token[:num_tokens],
++                        req_id_per_token,
+                         attn_metadata.block_table,
+                         topk_indices,
+                         BLOCK_SIZE=attn_metadata.block_size,
+--- a/vllm/v1/attention/ops/dcp.py
++++ b/vllm/v1/attention/ops/dcp.py
+@@ -1491,6 +1491,12 @@
+         parallel_config = vllm_config.parallel_config
+         self.group = get_dcp_group()
+         self.device = torch.device(device)
++        if self.device.type == "meta":
++            # Online quantization builds the weights on the meta device; the
++            # exchange buffers belong on this rank's GPU.
++            self.device = torch.device(
++                current_platform.device_type, torch.accelerator.current_device_index()
++            )
+         self.num_ubatches = max(parallel_config.num_ubatches, 1)
+         self.max_num_tokens = get_dcp_workspace_max_num_tokens(vllm_config)
+         self.use_a2a = parallel_config.dcp_comm_backend == "a2a"
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -1354,6 +1354,16 @@
+                 # finishes; no extra reference must retain it through attention.
+                 del mqa_ql_nope
+             # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
++            split_ckv_dcp = (
++                self.impl.dcp_world_size > 1
++                and not self.use_pcp
++                and not full_ckv_dcp
++                and not qrep_decode
++                and hasattr(self.impl, "uses_split_ckv_dcp")
++                and self.impl.uses_split_ckv_dcp(  # type: ignore[attr-defined]
++                    attn_metadata, num_mqa_tokens
++                )
++            )
+             if self.impl.dcp_world_size > 1:
+                 assert self.dcp_manager is not None
+                 if self.use_pcp:
+@@ -1361,7 +1371,7 @@
+                         if isinstance(mqa_q, tuple):
+                             mqa_q = torch.cat(mqa_q, dim=-1)
+                         mqa_q = get_tp_group().all_gather(mqa_q, dim=1)
+-                else:
++                elif not split_ckv_dcp:
+                     if isinstance(mqa_q, tuple):
+                         # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                         mqa_q = (
+@@ -1376,35 +1386,42 @@
+             # call decode attn
+             if not self.impl.is_sparse:
+                 assert attn_metadata.decode is not None
+-            attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
++            if split_ckv_dcp:
++                # Mixed batch: decode rows keep the query exchange, prefill
++                # rows attend over the gathered cache of their own requests.
++                attn_out = self._split_ckv_dcp_mqa(
++                    mqa_q, kv_cache, attn_metadata, num_mqa_tokens
++                )
++            else:
++                attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
+ 
+-            # correct dcp attn_out with lse.
+-            if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
+-                assert lse is not None
+-                assert self.dcp_manager is not None
+-                decode_metadata = getattr(attn_metadata, "decode", None)
+-                if not use_mha:
+-                    seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
+-                    query_start_loc = attn_metadata.query_start_loc
+-                else:
+-                    seq_lens = (
+-                        decode_metadata.seq_lens
+-                        if decode_metadata is not None
+-                        else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
+-                            : attn_metadata.num_decodes
++                # correct dcp attn_out with lse.
++                if self.impl.dcp_world_size > 1 and not full_ckv_dcp:
++                    assert lse is not None
++                    assert self.dcp_manager is not None
++                    decode_metadata = getattr(attn_metadata, "decode", None)
++                    if not use_mha:
++                        seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
++                        query_start_loc = attn_metadata.query_start_loc
++                    else:
++                        seq_lens = (
++                            decode_metadata.seq_lens
++                            if decode_metadata is not None
++                            else cast(torch.Tensor, attn_metadata.seq_lens)[  # type: ignore[attr-defined]
++                                : attn_metadata.num_decodes
++                            ]
++                        )
++                        query_start_loc = attn_metadata.query_start_loc[
++                            : attn_metadata.num_decodes + 1
+                         ]
++                    attn_out = self.dcp_manager.combine(
++                        attn_out,
++                        lse,
++                        seq_lens=seq_lens,
++                        query_start_loc=query_start_loc,
+                     )
+-                    query_start_loc = attn_metadata.query_start_loc[
+-                        : attn_metadata.num_decodes + 1
+-                    ]
+-                attn_out = self.dcp_manager.combine(
+-                    attn_out,
+-                    lse,
+-                    seq_lens=seq_lens,
+-                    query_start_loc=query_start_loc,
+-                )
+-                if self.use_pcp:
+-                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
++                    if self.use_pcp:
++                        attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
+ 
+             # v_up projection
+             self._v_up_proj(attn_out, out=mqa_output_slice)
+@@ -1452,6 +1469,54 @@
+             output_padded[num_actual_toks:].zero_()
+         return output_padded
+ 
++    def _split_ckv_dcp_mqa(
++        self,
++        mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
++        kv_cache: torch.Tensor,
++        attn_metadata: "MLACommonMetadata",
++        num_actual: int,
++    ) -> torch.Tensor:
++        """Attend a mixed DCP batch in two parts.
++
++        Decode rows (ordered first) exchange their queries and merge LSE
++        across the DCP group; prefill rows attend with their local heads over
++        the gathered cache of their own requests, which moves far fewer bytes
++        than exchanging every head's queries and outputs.
++        """
++        assert self.dcp_manager is not None
++        assert self.dcp_manager.query_gather is not None
++        num_decode = int(attn_metadata.num_decode_tokens)
++        if isinstance(mqa_q_arg, tuple):
++            mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
++            prefill_q = mqa_q_arg[num_decode:num_actual]
++        else:
++            # The packed query may alias the kernel workspace both calls use.
++            prefill_q = mqa_q_arg[num_decode:num_actual].clone()
++        decode_q = self.dcp_manager.query_gather(mqa_q_arg[:num_decode])
++        decode_out, decode_lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
++            decode_q, kv_cache, attn_metadata, self, route="extend"
++        )
++        assert decode_lse is not None
++        decode_out = self.dcp_manager.combine(
++            decode_out, decode_lse, seq_lens=None, query_start_loc=None
++        )
++        attn_out = torch.empty(
++            (num_actual, *decode_out.shape[1:]),
++            dtype=decode_out.dtype,
++            device=decode_out.device,
++        )
++        attn_out[:num_decode].copy_(decode_out)
++        prefill_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
++            prefill_q,
++            kv_cache,
++            attn_metadata,
++            self,
++            row_start=num_decode,
++            route="ckv_extend",
++        )
++        attn_out[num_decode:].copy_(prefill_out)
++        return attn_out
++
+     def _use_sparse_mha(self, attn_metadata: "MLACommonMetadata") -> bool:
+         if self.hisparse_cache is not None:
+             return False

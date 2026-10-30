@@ -1,0 +1,77 @@
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -681,7 +681,15 @@
+                             in ("glm5_next_text", "glm5_next")
+                         )
+                     )
+-                    and not self.speculative_config.uses_dynamic_speculative_decoding()
++                    # Acceptance-adaptive depth (adaptive window set, no
++                    # batch-size schedule) stays allowed: boundary checkpoints
++                    # read actual per-step counters (SchedulerOutput.resolve_
++                    # num_spec_tokens_to_schedule, boundary_checkpoint_tokens),
++                    # not the static k. The batch-size schedule remains
++                    # forbidden — its cudagraph tiers assume fixed depth per
++                    # batch size.
++                    and self.speculative_config.num_speculative_tokens_per_batch_size
++                    is None
+                 )
+             )
+             and parallel.pipeline_parallel_size == 1
+@@ -2518,29 +2526,34 @@
+                         schedule = (
+                             speculative_config.num_speculative_tokens_per_batch_size
+                         )
+-                        assert schedule is not None
+-                        # Read the tiers off the dense lookup the scheduler
+-                        # runs on, so the clamp against num_speculative_tokens
+-                        # and the carry-forward through gaps and the tail
+-                        # cannot drift from it. Validation lives elsewhere; an
+-                        # invalid schedule keeps the single-tier default.
+-                        try:
+-                            dense_schedule = build_dynamic_sd_schedule_lookup(
+-                                schedule,
+-                                vllm_max_batch_size=max_num_seqs,
+-                                vllm_num_speculative_tokens=self.num_speculative_tokens,
+-                            )
+-                        except ValueError:
+-                            pass
+-                        else:
+-                            # Ascending batch size, so the last write per
+-                            # query length is the widest batch running at it.
+-                            widest_batch: dict[int, int] = {}
+-                            for batch_size, num_spec in enumerate(
+-                                dense_schedule[1:], start=1
+-                            ):
+-                                widest_batch[num_spec + 1] = batch_size
+-                            decode_tiers = list(widest_batch.items())
++                        # Acceptance-adaptive depth (adaptive window, no
++                        # batch-size schedule) has no per-depth tiers: depth
++                        # varies over time at a fixed batch size. Keep the
++                        # single default tier (max depth) and let decode
++                        # dispatch pad to the captured sizes.
++                        if schedule is not None:
++                            # Read the tiers off the dense lookup the scheduler
++                            # runs on, so the clamp against num_speculative_tokens
++                            # and the carry-forward through gaps and the tail
++                            # cannot drift from it. Validation lives elsewhere; an
++                            # invalid schedule keeps the single-tier default.
++                            try:
++                                dense_schedule = build_dynamic_sd_schedule_lookup(
++                                    schedule,
++                                    vllm_max_batch_size=max_num_seqs,
++                                    vllm_num_speculative_tokens=self.num_speculative_tokens,
++                                )
++                            except ValueError:
++                                pass
++                            else:
++                                # Ascending batch size, so the last write per
++                                # query length is the widest batch running at it.
++                                widest_batch: dict[int, int] = {}
++                                for batch_size, num_spec in enumerate(
++                                    dense_schedule[1:], start=1
++                                ):
++                                    widest_batch[num_spec + 1] = batch_size
++                                decode_tiers = list(widest_batch.items())
+ 
+                     uniform_decode_sizes = sorted(
+                         {
