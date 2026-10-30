@@ -55,12 +55,54 @@ docker run --rm -v $PWD/tests:/tests:ro -w /tests \
 
 14 split-CKV cases + 7 SJF cases, all green on `release-10152026`.
 
-## Measured findings
+## Speed measurements (updated 31.10)
 
-[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) — speed tests across configs
-(spec depth k=2/k=3, greedy vs probabilistic draft sampling, prefill chunk
-4096 vs 8192, pp=1 vs pp=2, adaptive depth, split-CKV, reasoning_effort
-levels), with the three measurement forms and cross-comparison rules.
+Three measurement forms, **not** cross-comparable — details, methods and rules
+in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md):
+
+- **F1** single-stream greedy decode (temp 0, cached prompt, median n=5);
+- **F2** bench suite (temp 1.0, short/med/long, idle-gated);
+- **F3** live inter-token row under mixed agent-swarm load.
+
+### F2 — bench suite (tok/s)
+
+| Config | short | med | long | accept |
+|---|---|---|---|---|
+| k=3 probabilistic, pp=1, chunk 4096 (28.10 base) | 150.22 | 159.09 | 180.17* | 0.44/0.51/0.68 |
+| k=2 probabilistic, pp=1, chunk 4096 (28.10) | ~parity | +5.7% | +9.3%* | 0.64/0.64/0.76 |
+| k=3 **greedy** draft, pp=1, chunk 4096 (30.10) | 153.40 | 159.80 | 225.49* | 0.41/0.43/0.68 |
+| adaptive depth window 64 / initial 3 (30.10, canary A) | 123–130 (**−15–20%**) | −11% | — | — |
+| split-CKV `MIXED=1`, adaptive off (30.10, canary B) | −3–4% (noise) | 162 | 232* | — |
+
+\* long deltas unconfirmed — cross-run prefix-cache warmth contaminates long
+rows; short/med are gated and decisive.
+
+### F1 — single-stream greedy decode
+
+| Config | Decode tok/s |
+|---|---|
+| k=3, probabilistic draft (28.10) | **259.2** median (256.1–261.2, n=5), TTFT 23 ms |
+| k=2, probabilistic draft (28.10) | 217 (**−16%**) |
+
+### F3 — live mixed load
+
+| Era | p50 | p90 | p99 |
+|---|---|---|---|
+| pp=2 era (29.10) | 0.75 s | 2.5 s | **80 s** |
+
+Tail = small interactive turns behind deep prefills ([issue #1020](https://github.com/local-inference-lab/vllm/issues/1020));
+single-start probes did not degrade (pp=1 vs pp=2: warm 0.05/0.033 s, cold 9K 1.06/1.24 s).
+
+### Other configs
+
+| Config | Result |
+|---|---|
+| Prefill chunk 8192 (vs 4096) | decode parity (218.1 vs 217.3), queue worse (TTFT 3.9 s vs 1.1 s), KV −17% — **closed** |
+| reasoning_effort low / high / max | 0.6–1.1 s / 0.8–2.6 s / 2.6–10.3 s per fix task; quality 6/6, 6/6, 5/6 (max overthinks) |
+| Draft acceptance (live, temp 1.0) | 55.5% accept, **1.66 tok/step** over k=3 positions |
+| Adaptive depth verdict | FAIL by speed (kept off); correctness perfect (lossless A/B, quality 20/20) |
+
+## Measured findings
 
 [docs/findings.md](docs/findings.md) — KV/L1 eviction thrash under working-set
 pressure; live confirmation of
