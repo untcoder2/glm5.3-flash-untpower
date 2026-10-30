@@ -57,6 +57,11 @@ docker run --rm -v $PWD/tests:/tests:ro -w /tests \
 
 ## Measured findings
 
+[docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) — speed tests across configs
+(spec depth k=2/k=3, greedy vs probabilistic draft sampling, prefill chunk
+4096 vs 8192, pp=1 vs pp=2, adaptive depth, split-CKV, reasoning_effort
+levels), with the three measurement forms and cross-comparison rules.
+
 [docs/findings.md](docs/findings.md) — KV/L1 eviction thrash under working-set
 pressure; live confirmation of
 [issue #1020](https://github.com/local-inference-lab/vllm/issues/1020)
