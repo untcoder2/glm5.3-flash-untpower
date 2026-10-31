@@ -73,6 +73,7 @@ in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md):
 | k=3 **greedy** draft, pp=1, chunk 4096 (30.10) | 153.40 | 159.80 | 225.49* | 0.41/0.43/0.68 |
 | adaptive depth window 64 / initial 3 (30.10, canary A) | 123–130 (**−15–20%**) | −11% | — | — |
 | split-CKV `MIXED=1`, adaptive off (30.10, canary B) | −3–4% (noise) | 162 | 232* | — |
+| greedy + local-argmax + SJF + split-CKV, all on (31.10 battle, warm cache, 2 runs) | 140.6 / 143.1 | 164.9 / 162.2 | 213.7 / 190.3* | 0.34–0.36 / 0.42–0.47 / 0.65–0.66 |
 
 \* long deltas unconfirmed — cross-run prefix-cache warmth contaminates long
 rows; short/med are gated and decisive.
@@ -83,6 +84,16 @@ rows; short/med are gated and decisive.
 |---|---|
 | k=3, probabilistic draft (28.10) | **259.2** median (256.1–261.2, n=5), TTFT 23 ms |
 | k=2, probabilistic draft (28.10) | 217 (**−16%**) |
+| k=3 greedy + local-argmax + SJF + split-CKV, all on (31.10 battle, warm cache) | 256.6 (255.4–256.9, n=5), TTFT 23 ms — parity |
+
+### Prefill / refill (TTFT, stream, cold = unique header + seeded filler)
+
+| Probe | TTFT | Prefill tok/s |
+|---|---|---|
+| 9K cold | 1.06 s (etalon 1.048 s — parity) | 8 500 |
+| 60K cold | 5.9 s | 10 100 |
+| 60K repeat, same prompt (cache refill) | **0.056 s** (cached 59 790/59 790) | **×106 vs cold** |
+| 200K cold | 25.0 s | 8 000 |
 
 ### F3 — live mixed load
 

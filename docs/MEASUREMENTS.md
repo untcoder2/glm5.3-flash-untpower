@@ -101,6 +101,26 @@ Per-position draft acceptance collector (30-min tick): **55.5% accept,
 1.66 tokens/step** summed over k=3 positions. Greedy-era SGLang acceptance
 (~5.07) is not comparable at temp 1.0 — acceptance is structurally lower there.
 
+## Prefill / refill battery (31.10, battle config, warm cache, idle-gated)
+
+Method: each probe = unique header at position 0 (guarantees coldness against
+prefix cache) + seeded filler, stream `/v1/completions`, TTFT = time to first
+text chunk, usage from the final chunk (`stream_options.include_usage`).
+The 60K probe runs twice on the **same** text: pass b = refill from cache
+(LMCache + radix). Idle gate between probes (running==0 ∧ waiting==0, two
+samples 10 s apart).
+
+| Probe | TTFT | prompt tok | cached | Prefill tok/s |
+|---|---|---|---|---|
+| 9K cold | 1.057 s | 8 995 | 0 | 8 508 |
+| 60K cold (a) | 5.926 s | 59 790 | 0 | 10 089 |
+| 60K refill (b, same text) | **0.056 s** | 59 790 | 59 790 | — (×106 vs cold) |
+| 200K cold | 25.04 s | 199 595 | 0 | 7 970 |
+
+Scaling is mildly superlinear (200K/60K = 3.34× tokens → 4.2× time), consistent
+with attention cost growth over long contexts. The 9K cold number matches the
+30.10 etalon (1.048 s) to 1% — the method is comparable across days.
+
 ## Open questions (measured nothing yet, deliberately)
 
 - k=3 vs k=2 on **both** F1 and F2 in one quiet window — F1 agent traffic is
