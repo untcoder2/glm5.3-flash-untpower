@@ -29,7 +29,8 @@ offloading connector at request boundaries.
    so long prefills cannot starve. Targets head-of-line start latency under mixed
    load (agent swarms: an interactive turn queues behind a neighbour's long
    re-prefill; live inter-token row p50 0.75 s / p90 2.5 s / **p99 80 s**).
-   **Status: written, reviewed (2 rounds), staged for a live window.**
+   **Status: live in production since 06.11** (env-gated, carried by watchdog/LKG
+   on restarts), 2 review rounds, 7/7 tests.
    → [docs/sjf-prefill-queue.md](docs/sjf-prefill-queue.md),
    [diff](diffs/20261031-sjf-prefill-queue.diff)
 
@@ -55,6 +56,21 @@ offloading connector at request boundaries.
    v0.5.7 rebase (upstream fix native in the `blend/` package).**
    → [docs/blend6228-chunk0-fingerprint.md](docs/blend6228-chunk0-fingerprint.md),
    [diff](diffs/20261106-blend6228-chunk0-fingerprint.diff)
+
+## Upstream
+
+- **[vllm#64312](https://github.com/vllm-project/vllm/pull/64312)** (merged 03.11)
+  landed CSF-compressed NVFP4 scale loading — including `csf_32x2_v1`, our exact
+  checkpoint format (`nvidia/GLM-5.3-Flash-FP4-Local`). Community `main` is now a
+  candidate base for this model.
+- **[vllm#66218](https://github.com/vllm-project/vllm/issues/66218)** — our
+  feature request: what's missing for a full community-main base (prefill
+  admission control, cache parallelism for `glm5_next`, SM120 validation) and
+  what we offer back (PRs from these diffs, acceptance battery on our hardware,
+  production telemetry).
+- **Field evidence on [vllm#51375](https://github.com/vllm-project/vllm/pull/51375#issuecomment-6701258815)**
+  (residual-aware SJF): live HoL numbers from our workload and our SJF
+  implementation; that PR is the right generalization of our queue.
 
 ## Tests
 
