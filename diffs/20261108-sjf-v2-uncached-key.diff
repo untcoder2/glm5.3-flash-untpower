@@ -1,0 +1,155 @@
+--- a/vllm/v1/core/sched/request_queue.py
++++ b/vllm/v1/core/sched/request_queue.py
+@@ -217,14 +217,18 @@
+     is ignored while the flag is set); the aging threshold is
+     VLLM_SCHED_PREFILL_SJF_AGING_S seconds.
+ 
+-    Known v1 limitation: the sort key is the request's total prompt length,
+-    not the uncached remainder — a long session with a warm prefix cache is
+-    de-prioritized even though its re-prefill is small. Bounded by the queue
+-    depth; the true-uncached ordering needs admission-time radix lookups.
++    v2: the sort key is the UNCACHED remainder (real prefill work), probed
++    lazily via the injected cache_probe (scheduler-side read-only
++    coordinator.find_longest_cache_hit) with a 1s per-request memo; a warm
++    fat session (huge prompt, tiny re-prefill) is ordered by its actual
++    work. Falls back to total prompt length when no probe is available or
++    the lookup fails (sparse-retention groups, caching disabled).
+     """
+ 
+-    def __init__(self) -> None:
++    def __init__(self, cache_probe=None) -> None:
+         super().__init__()
++        self._cache_probe = cache_probe
++        self._probe_memo: dict[int, tuple[float, int]] = {}
+         self._arrival: dict[int, float] = {}
+         # Requests explicitly re-queued at the front (prepend): admitted
+         # before the SJF order, in prepend order.
+@@ -236,6 +240,21 @@
+     def _is_aged(self, request: Request, now: float) -> bool:
+         return now - self._arrival_of(request) >= envs.VLLM_SCHED_PREFILL_SJF_AGING_S
+ 
++    def _work(self, request: Request) -> int:
++        """Real prefill work: uncached remainder when a probe is available."""
++        if self._cache_probe is None:
++            return request.num_tokens
++        now = time.monotonic()
++        memo = self._probe_memo.get(id(request))
++        if memo is not None and now - memo[0] < 1.0:
++            return memo[1]
++        try:
++            work = max(0, int(self._cache_probe(request)))
++        except Exception:
++            work = request.num_tokens
++        self._probe_memo[id(request)] = (now, work)
++        return work
++
+     def _selected(self) -> Request:
+         """The request the policy admits next, without removing it."""
+         if self._front:
+@@ -250,7 +269,7 @@
+             # Bypass group: FIFO by arrival.
+             return min(aged, key=lambda t: (t[0], t[1]))[2]
+         return min(deque.__iter__(self),
+-                   key=lambda r: (r.num_tokens, self._arrival_of(r)))
++                   key=lambda r: (self._work(r), self._arrival_of(r)))
+ 
+     def add_request(self, request: Request) -> None:
+         """Add a request to the queue according to the SJF policy."""
+@@ -269,6 +288,7 @@
+         else:
+             self.remove(request)
+         self._arrival.pop(id(request), None)
++        self._probe_memo.pop(id(request), None)
+         return request
+ 
+     def peek_request(self) -> Request:
+@@ -309,6 +329,7 @@
+         else:
+             self.remove(request)
+         self._arrival.pop(id(request), None)
++        self._probe_memo.pop(id(request), None)
+ 
+     def remove_requests(self, requests: Iterable[Request]) -> None:
+         """Remove multiple specific requests from the queue.
+@@ -326,6 +347,9 @@
+         for rid in list(self._arrival):
+             if rid not in survivors:
+                 del self._arrival[rid]
++        for rid in list(self._probe_memo):
++            if rid not in survivors:
++                del self._probe_memo[rid]
+ 
+     def __bool__(self) -> bool:
+         """Check if queue has any requests (front members included)."""
+@@ -349,13 +373,13 @@
+             arrival = self._arrival_of(request)
+             if self._is_aged(request, now):
+                 return (0, arrival, 0)
+-            return (1, request.num_tokens, arrival)
++            return (1, self._work(request), arrival)
+ 
+         rest = [r for r in deque.__iter__(self) if id(r) not in front_ids]
+         return iter([*self._front, *sorted(rest, key=key)])
+ 
+ 
+-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
++def create_request_queue(policy: SchedulingPolicy, cache_probe=None) -> RequestQueue:
+     """Create request queue based on scheduling policy.
+ 
+     VLLM_SCHED_PREFILL_SJF=1 overrides the configured policy with the
+@@ -363,7 +387,7 @@
+     VLLM_SCHED_PREFILL_SJF_AGING_S).
+     """
+     if envs.VLLM_SCHED_PREFILL_SJF:
+-        return SJFRequestQueue()
++        return SJFRequestQueue(cache_probe=cache_probe)
+     if policy == SchedulingPolicy.PRIORITY:
+         return PriorityRequestQueue()
+     elif policy == SchedulingPolicy.FCFS:
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -243,10 +243,32 @@
+             raise ValueError(
+                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
+             ) from e
++        # SJF v2: real prefill work = prompt minus radix-cached prefix. The
++        # probe reads the coordinator lazily (kv_cache_manager may not exist
++        # yet at queue construction) and is read-only; any inconsistency
++        # (sparse-retention groups, caching off, errors) falls back to the
++        # total prompt length.
++        def _sjf_uncached_work(request):
++            try:
++                manager = getattr(self, "kv_cache_manager", None)
++                if manager is None or not manager.enable_caching:
++                    return request.num_tokens
++                coordinator = manager.coordinator
++                _, cached, _ = coordinator.find_longest_cache_hit(
++                    request.block_hashes,
++                    max(0, request.num_tokens
++                        - max(1, coordinator.prefill_replay_tokens)),
++                )
++                return max(0, request.num_tokens - cached)
++            except Exception:
++                return request.num_tokens
++        self._sjf_uncached_work = _sjf_uncached_work
+         # Priority queues for requests.
+-        self.waiting = create_request_queue(self.policy)
++        self.waiting = create_request_queue(
++            self.policy, cache_probe=self._sjf_uncached_work)
+         # requests skipped in waiting flow due async deps or constraints.
+-        self.skipped_waiting = create_request_queue(self.policy)
++        self.skipped_waiting = create_request_queue(
++            self.policy, cache_probe=self._sjf_uncached_work)
+         self.running: list[Request] = []
+ 
+         # The request IDs that are finished in between the previous and the
+@@ -1344,7 +1366,8 @@
+ 
+         # Next, schedule the WAITING requests.
+         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+-            step_skipped_waiting = create_request_queue(self.policy)
++            step_skipped_waiting = create_request_queue(
++                self.policy, cache_probe=self._sjf_uncached_work)
+             external_admission = (
+                 self.connector is not None
+                 and self.kv_cache_manager.boundary_checkpoints is not None

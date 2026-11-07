@@ -9,7 +9,10 @@ from collections.abc import Iterable, Iterator
 from enum import Enum
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class SchedulingPolicy(Enum):
@@ -217,14 +220,20 @@ class SJFRequestQueue(deque[Request], RequestQueue):
     is ignored while the flag is set); the aging threshold is
     VLLM_SCHED_PREFILL_SJF_AGING_S seconds.
 
-    Known v1 limitation: the sort key is the request's total prompt length,
-    not the uncached remainder — a long session with a warm prefix cache is
-    de-prioritized even though its re-prefill is small. Bounded by the queue
-    depth; the true-uncached ordering needs admission-time radix lookups.
+    v2: the sort key is the UNCACHED remainder (real prefill work), probed
+    lazily via the injected cache_probe (scheduler-side read-only
+    coordinator.find_longest_cache_hit) with a 1s per-request memo; a warm
+    fat session (huge prompt, tiny re-prefill) is ordered by its actual
+    work. Falls back to total prompt length when no probe is available or
+    the lookup fails (sparse-retention groups, caching disabled).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cache_probe=None) -> None:
         super().__init__()
+        self._cache_probe = cache_probe
+        self._probe_memo: dict[int, tuple[float, int]] = {}
+        self._probe_warn_at = 0.0
+        self._probe_fallback_total = 0
         self._arrival: dict[int, float] = {}
         # Requests explicitly re-queued at the front (prepend): admitted
         # before the SJF order, in prepend order.
@@ -235,6 +244,32 @@ class SJFRequestQueue(deque[Request], RequestQueue):
 
     def _is_aged(self, request: Request, now: float) -> bool:
         return now - self._arrival_of(request) >= envs.VLLM_SCHED_PREFILL_SJF_AGING_S
+
+    def _work(self, request: Request) -> int:
+        """Real prefill work: uncached remainder when a probe is available."""
+        if self._cache_probe is None:
+            return request.num_tokens
+        now = time.monotonic()
+        memo = self._probe_memo.get(id(request))
+        if memo is not None and now - memo[0] < 1.0:
+            return memo[1]
+        try:
+            work = max(0, int(self._cache_probe(request)))
+        except Exception as exc:
+            # Единственная точка fallback: замыкание зонда исключения не глотает.
+            # Провал НЕ мемоизируется — ретрай на следующем pick, warning не чаще
+            # раза в 60с, счётчик для инспекции.
+            now2 = time.monotonic()
+            if now2 - self._probe_warn_at >= 60.0:
+                logger.warning(
+                    "SJF v2 probe failed (%s); falling back to total prompt length",
+                    exc,
+                )
+                self._probe_warn_at = now2
+            self._probe_fallback_total += 1
+            return request.num_tokens
+        self._probe_memo[id(request)] = (now, work)
+        return work
 
     def _selected(self) -> Request:
         """The request the policy admits next, without removing it."""
@@ -250,7 +285,7 @@ class SJFRequestQueue(deque[Request], RequestQueue):
             # Bypass group: FIFO by arrival.
             return min(aged, key=lambda t: (t[0], t[1]))[2]
         return min(deque.__iter__(self),
-                   key=lambda r: (r.num_tokens, self._arrival_of(r)))
+                   key=lambda r: (self._work(r), self._arrival_of(r)))
 
     def add_request(self, request: Request) -> None:
         """Add a request to the queue according to the SJF policy."""
@@ -269,6 +304,7 @@ class SJFRequestQueue(deque[Request], RequestQueue):
         else:
             self.remove(request)
         self._arrival.pop(id(request), None)
+        self._probe_memo.pop(id(request), None)
         return request
 
     def peek_request(self) -> Request:
@@ -309,6 +345,7 @@ class SJFRequestQueue(deque[Request], RequestQueue):
         else:
             self.remove(request)
         self._arrival.pop(id(request), None)
+        self._probe_memo.pop(id(request), None)
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         """Remove multiple specific requests from the queue.
@@ -326,6 +363,9 @@ class SJFRequestQueue(deque[Request], RequestQueue):
         for rid in list(self._arrival):
             if rid not in survivors:
                 del self._arrival[rid]
+        for rid in list(self._probe_memo):
+            if rid not in survivors:
+                del self._probe_memo[rid]
 
     def __bool__(self) -> bool:
         """Check if queue has any requests (front members included)."""
@@ -349,13 +389,13 @@ class SJFRequestQueue(deque[Request], RequestQueue):
             arrival = self._arrival_of(request)
             if self._is_aged(request, now):
                 return (0, arrival, 0)
-            return (1, request.num_tokens, arrival)
+            return (1, self._work(request), arrival)
 
         rest = [r for r in deque.__iter__(self) if id(r) not in front_ids]
         return iter([*self._front, *sorted(rest, key=key)])
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+def create_request_queue(policy: SchedulingPolicy, cache_probe=None) -> RequestQueue:
     """Create request queue based on scheduling policy.
 
     VLLM_SCHED_PREFILL_SJF=1 overrides the configured policy with the
@@ -363,7 +403,7 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     VLLM_SCHED_PREFILL_SJF_AGING_S).
     """
     if envs.VLLM_SCHED_PREFILL_SJF:
-        return SJFRequestQueue()
+        return SJFRequestQueue(cache_probe=cache_probe)
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:

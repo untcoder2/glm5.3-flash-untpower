@@ -25,14 +25,19 @@ offloading connector at request boundaries.
    [diff](diffs/20261029-split-ckv-glm5next.diff)
 
 2. **SJF waiting-queue for prefill admissions (with aging)** — env-gated replacement
-   for the FCFS waiting queue: shortest-job-first by prompt length, 30 s aging bypass
+   for the FCFS waiting queue: shortest-job-first, 30 s aging bypass
    so long prefills cannot starve. Targets head-of-line start latency under mixed
    load (agent swarms: an interactive turn queues behind a neighbour's long
    re-prefill; live inter-token row p50 0.75 s / p90 2.5 s / **p99 80 s**).
    **Status: live in production since 06.11** (env-gated, carried by watchdog/LKG
    on restarts), 2 review rounds, 7/7 tests.
+   **v2 (08.11): admission key = uncached remainder** — read-only radix probe at
+   admission (memoized, single rate-limited fallback to total length); closes the
+   warm-fat HoL case (v1 live: **TTFT 45.9 s at a 99.98% cache hit**; v2 live:
+   0.87–1.06 s turn-to-turn, zero stalls), review PASS/PASS, 8/8 tests.
    → [docs/sjf-prefill-queue.md](docs/sjf-prefill-queue.md),
-   [diff](diffs/20261031-sjf-prefill-queue.diff)
+   [v1 diff](diffs/20261031-sjf-prefill-queue.diff),
+   [v2 diff](diffs/20261108-sjf-v2-uncached-key.diff)
 
 3. **Request-boundary-checkpoints gate: dynamic speculative decoding × Semantic
    LMCache** — enabling adaptive spec depth with the semantic LMCache connector dies

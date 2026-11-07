@@ -51,11 +51,35 @@ Full module: [files/sjf/request_queue.py](../files/sjf/request_queue.py)
   env-gate factory both ways), all green in the container.
 - Two independent review rounds on our side (correctness + security) with the
   abort-crash PoC fixed and re-verified.
-- Status: **staged for a live window** (not yet in production).
+- Status: **live in production since 06.11** (env-gated, carried by the
+  watchdog/LKG restore chain on restarts).
 
-## Known limitation
+## v2 (08.11): admission key = uncached remainder
 
-The sort key is the request's **total** prompt length, not the uncached
-remainder — a long session with a warm prefix cache is de-prioritized even
-though its actual re-prefill is small. Bounded by queue depth; the true-uncached
-ordering needs admission-time radix lookups. Documented in the module docstring.
+The total-length key above bit in production: a warm fat session (252 692-token
+prompt, 58 tokens of actual work) queued as the "longest job" through the full
+30 s aging — observed **TTFT 45.9 s at a 99.98% cache hit** (no prefill, no
+eviction: pure queue wait; the p99 row above was the same effect at smaller
+scale).
+
+v2 keys the queue by the request's **uncached remainder**:
+
+- the scheduler injects a read-only probe at construction —
+  `coordinator.find_longest_cache_hit(request.block_hashes, max(0, num_tokens -
+  max(1, coordinator.prefill_replay_tokens)))`, an admission-time radix lookup
+  with no pool mutation (`get_computed_blocks` is deliberately NOT used: it
+  mutates request state);
+- probe results are memoized for 1 s per request;
+- a single fallback point (`SJFRequestQueue._work`): a probe exception logs a
+  rate-limited warning (60 s) with a fallback counter and falls back to the
+  total prompt length — a broken radix cannot crash admission;
+- aging bypass, prepend-front semantics and tolerant removal are unchanged.
+
+Status: **live in production since 08.11**. Review: correctness PASS, security
+PASS (probe purity verified against the coordinator source). Tests:
+`tests/test_sjf_v2.py` — 8 cases (warm-fat-first regression, both fallback
+paths, aged bypass, prepend, tolerant removal, iteration order, probe-aware
+factory), all green in the container. Live check: 15 consecutive interactive
+turns on the warm fat session — 0.87–1.06 s turn-to-turn, zero stalls.
+
+Diff (v1 → v2): [diffs/20261108-sjf-v2-uncached-key.diff](../diffs/20261108-sjf-v2-uncached-key.diff)
