@@ -1,0 +1,133 @@
+diff --git a/lmcache/v1/multiprocess/modules/blend.py b/lmcache/v1/multiprocess/modules/blend.py
+index ad12df4b..444864e6 100644
+--- a/lmcache/v1/multiprocess/modules/blend.py
++++ b/lmcache/v1/multiprocess/modules/blend.py
+@@ -278,7 +278,6 @@ class BlendTokenRangeMatcher:
+         self,
+         token_ids: list[int],
+         token_hashes: list[bytes],
+-        start_chunk_idx: int = 0,
+         position_offset: int = 0,
+     ) -> int:
+         """Index a stored sequence's non-overlapping chunks into the matcher.
+@@ -294,8 +293,6 @@ class BlendTokenRangeMatcher:
+             token_ids (list[int]): The stored sequence's token IDs.
+             token_hashes (list[bytes]): Per-chunk content hashes (one per
+                 chunk), used as the dedup/eviction key.
+-            start_chunk_idx (int): First chunk to index; 1 skips chunk 0 (the
+-                prefix lookup leg owns it).
+             position_offset (int): Added to each recorded start position (for
+                 indexing a tail-slice of a larger sequence).
+ 
+@@ -307,13 +304,13 @@ class BlendTokenRangeMatcher:
+         arr = np.array(token_ids, dtype=np.uint64)
+         chunk_hashes = chunk_hash_windows_numba(arr, self.chunk_size, self._BASE)
+         n = int(chunk_hashes.shape[0])
+-        if n == 0 or start_chunk_idx >= n:
++        if n == 0:
+             return 0
+ 
+         with self._lock:
+             new_idxs: list[int] = []
+             batch_poly: set[int] = set()
+-            for i in range(start_chunk_idx, n):
++            for i in range(n):
+                 if token_hashes[i] in self._token_hash_to_compact_id:
+                     continue
+                 if self._dedup_content:
+@@ -785,10 +782,10 @@ class BlendModule(InstanceLivenessTarget):
+         self._cb_jobs_lock = threading.Lock()
+ 
+         # Async fingerprint registration: store enqueues, worker drains.
+-        # (tokens_in_range, chunk_hashes, start_chunk_idx, position_offset,
++        # (tokens_in_range, chunk_hashes, position_offset,
+         # request_id). The request_id is the enqueuing store's, so the
+         # registration event is attributed to it rather than to the drainer.
+-        _FpJob = tuple[list[int], list[bytes], int, int, str]
++        _FpJob = tuple[list[int], list[bytes], int, str]
+         self._fingerprint_queue: "Queue[_FpJob]" = Queue()
+         self._fingerprint_stop = threading.Event()
+         self._fingerprint_worker = threading.Thread(
+@@ -1067,12 +1064,11 @@ class BlendModule(InstanceLivenessTarget):
+                 job = self._fingerprint_queue.get_nowait()
+             except QueueEmpty:
+                 break
+-            tokens_in_range, chunk_hashes, start_chunk_idx, position_offset, rid = job
++            tokens_in_range, chunk_hashes, position_offset, rid = job
+             try:
+                 n_new = self._token_range_matcher.on_new_token_hashes(
+                     tokens_in_range,
+                     chunk_hashes,
+-                    start_chunk_idx=start_chunk_idx,
+                     position_offset=position_offset,
+                 )
+                 self._emit_fingerprints_registered(rid, n_new)
+@@ -1084,8 +1080,7 @@ class BlendModule(InstanceLivenessTarget):
+ 
+         ``num_chunks`` is what ``on_new_token_hashes`` returned, so the event
+         counts only chunks actually indexed into the match table: it excludes
+-        the ``start_chunk_idx`` chunks the store skipped *and* chunks the
+-        matcher deduplicated (already registered by an earlier store). Nothing
++        chunks the matcher deduplicated (already registered by an earlier store). Nothing
+         is published when no chunk was indexed -- a re-store of known content
+         is not a registration.
+ 
+@@ -1792,8 +1787,8 @@ class BlendModule(InstanceLivenessTarget):
+ 
+         Delegates the KV write to ``LMCacheDrivenTransfer.store``, then (worker 0 only)
+         enqueues the chunk hashes for async fingerprint registration ordered
+-        after the L1 commit. Chunk 0 of a position-0 store is skipped (owned by
+-        the standard prefix path). Fingerprint failures are logged, never
++        after the L1 commit. Chunk 0 registers like any other chunk
++        (#6228 backport). Fingerprint failures are logged, never
+         raised — they do not affect store correctness.
+ 
+         Args:
+@@ -1832,18 +1827,17 @@ class BlendModule(InstanceLivenessTarget):
+             if not chunk_hashes:
+                 return result
+             tokens_in_range = list(key.token_ids)[key.start : key.end]
+-            # Chunk 0 is owned by the prefix lookup leg; its fingerprint
+-            # would be redundant.
+-            start_chunk_idx = 0 if key.start != 0 else 1
++            # Chunk 0 registers like any other chunk (#6228 backport): под
++            # align-mode Mamba прежний скип заставлял пересчитывать общий
++            # системный префикс целиком на blended-промптах.
+             job = (
+                 tokens_in_range,
+                 chunk_hashes,
+-                start_chunk_idx,
+                 key.start,
+                 key.request_id,
+             )
+             with self._pending_fp_lock:
+-                self._pending_fp_hashes.update(chunk_hashes[start_chunk_idx:])
++                self._pending_fp_hashes.update(chunk_hashes)
+             entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+             gpu_ctx = entry.cache_context if entry is not None else None
+             if gpu_ctx is not None and gpu_ctx.cupy_stream is not None:
+@@ -1974,12 +1968,11 @@ class BlendModule(InstanceLivenessTarget):
+                 job = self._fingerprint_queue.get(timeout=0.1)
+             except QueueEmpty:
+                 continue
+-            tokens_in_range, chunk_hashes, start_chunk_idx, position_offset, rid = job
++            tokens_in_range, chunk_hashes, position_offset, rid = job
+             try:
+                 n_new = self._token_range_matcher.on_new_token_hashes(
+                     tokens_in_range,
+                     chunk_hashes,
+-                    start_chunk_idx=start_chunk_idx,
+                     position_offset=position_offset,
+                 )
+                 self._emit_fingerprints_registered(rid, n_new)
+@@ -1987,9 +1980,7 @@ class BlendModule(InstanceLivenessTarget):
+                 logger.exception("CB fingerprint registration failed (async)")
+             finally:
+                 with self._pending_fp_lock:
+-                    self._pending_fp_hashes.difference_update(
+-                        chunk_hashes[start_chunk_idx:]
+-                    )
++                    self._pending_fp_hashes.difference_update(chunk_hashes)
+ 
+     def _cb_staged_groups(
+         self, gpu_context: BaseCacheContext

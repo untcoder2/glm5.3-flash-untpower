@@ -44,6 +44,18 @@ offloading connector at request boundaries.
    → [docs/dynamic-sd-boundary-gate.md](docs/dynamic-sd-boundary-gate.md),
    [diff](diffs/20261030-dynamic-sd-boundary-gate.diff)
 
+4. **Blend store-leg registers chunk 0 fingerprints (backport of LMCache
+   #6228)** — the sidecar's blend module skipped the first chunk of
+   position-0 stores, delegating it to the standard prefix path; blend-sliced
+   stores never got it indexed, so the shared system preamble was re-prefilled
+   for every new session. Upstream fix backported to the LIL lmcache line
+   (`0.5.3.dev453`): drop the `start_chunk_idx` plumbing, store leg registers
+   all chunks.
+   **Status: live in production since 06.11; superseded in our line by the
+   v0.5.7 rebase (upstream fix native in the `blend/` package).**
+   → [docs/blend6228-chunk0-fingerprint.md](docs/blend6228-chunk0-fingerprint.md),
+   [diff](diffs/20261106-blend6228-chunk0-fingerprint.diff)
+
 ## Tests
 
 `tests/` run inside the container without pytest:
