@@ -1,0 +1,339 @@
+--- a/lmcache/v1/distributed/storage_controllers/store_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/store_controller.py
+@@ -277,6 +277,15 @@
+ 
+ 
+ # Main class
++
++
++# L2 store batching: the read-pins of an eviction burst are taken at
++# reserve_read time; without a cap the whole burst stays pinned in SHM
++# until one giant NVMe write drains, over-committing the container's
++# memcg (OOM 07.11/08.11). Batches release pins in portions.
++_L2_STORE_BATCH_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB per store task
++_L2_STORE_RESERVE_SLICE = 8                     # keys reserved per step
++_L2_STORE_WAIT_TIMEOUT_S = 600                  # bounded inline drain
+ 
+ 
+ class StoreController(StorageControllerInterface):
+@@ -740,8 +749,14 @@
+         self._submit_plan(plan)
+ 
+     def _submit_plan(self, plan: dict[int, list[ObjectKey]]) -> list[ObjectKey]:
+-        """Submit one store task per adapter in ``plan``; return submitted keys."""
+-        l1_mgr = self._l1_manager
++        """Submit store tasks per adapter in byte-capped batches.
++
++        Each batch's store completes before the next batch's pages are
++        reserved: the read-pins are taken at ``reserve_read`` time, so
++        queuing a whole eviction burst would pin it entirely in SHM until
++        one giant sequential NVMe write drains — that unbounded pinning,
++        stacked on top of live L1 pages, is what over-committed the
++        container's memcg (OOM 07.11/08.11)."""
+         submitted: list[ObjectKey] = []
+ 
+         for adapter_index, target_keys in plan.items():
+@@ -756,14 +771,98 @@
+                 )
+                 continue
+ 
+-            # Reserve read to get MemoryObj references and hold read locks
+-            read_results = l1_mgr.reserve_read(target_keys)
+-
+-            successful_keys = []
+-            successful_objs = []
+-            not_found_keys: list[ObjectKey] = []
+-            write_locked_keys: list[ObjectKey] = []
+-            for key in target_keys:
++            submitted.extend(
++                self._submit_bounded_batches(adapter_index, target_keys)
++            )
++        return submitted
++
++    def _submit_bounded_batches(
++        self, adapter_index: int, target_keys: list[ObjectKey]
++    ) -> list[ObjectKey]:
++        """Reserve and submit ``target_keys`` in byte-capped batches with an
++        inline completion wait between batches."""
++        l1_mgr = self._l1_manager
++        adapter = self._l2_adapters[adapter_index]
++        submitted: list[ObjectKey] = []
++        not_found_keys: list[ObjectKey] = []
++        write_locked_keys: list[ObjectKey] = []
++
++        batch_keys: list[ObjectKey] = []
++        batch_objs = []
++        batch_bytes = 0
++
++        def flush_batch() -> bool:
++            """Submit the accumulated batch and drain it. Returns False when
++            the wait failed (stop flag or timeout) — the caller must stop
++            reserving further pages on top of the unfinalized pins."""
++            nonlocal batch_keys, batch_objs, batch_bytes, released
++            if not batch_keys:
++                return True
++            keys, objs = batch_keys, batch_objs
++            batch_keys, batch_objs, batch_bytes = [], [], 0
++            try:
++                task_id = adapter.submit_store_task(keys, objs)
++            except Exception:
++                logger.exception(
++                    "Failed to submit store task to adapter %d for %d keys.",
++                    adapter_index,
++                    len(keys),
++                )
++                l1_mgr.finish_read(keys)
++                # The keys' pins are released synchronously; they must not
++                # re-enter ``stranded`` on a later abort of this call (and
++                # must stay out of ``submitted`` so they remain re-storable).
++                released.update(keys)
++                return True
++            submitted.extend(keys)
++
++            self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
++                adapter_index=adapter_index,
++                keys=keys,
++                read_locked_keys=list(keys),
++            )
++            self._status_in_flight_count += 1
++
++            # All objects for a single store task share one layout (L1
++            # allocates uniform MemoryObjs per chunk), so total bytes is
++            # size * count — avoids summing N identical values.
++            total_bytes = objs[0].get_size() * len(objs)
++            self._event_bus.publish(
++                Event(
++                    event_type=EventType.L2_STORE_SUBMITTED,
++                    metadata={
++                        "adapter_index": adapter_index,
++                        "task_id": task_id,
++                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
++                        "key_count": len(keys),
++                        "total_bytes": total_bytes,
++                        "key_count_per_salt": Counter(
++                            k.cache_salt for k in keys
++                        ),
++                    },
++                )
++            )
++
++            logger.debug(
++                "Submitted store task %d to adapter %d with %d keys (%d bytes).",
++                task_id,
++                adapter_index,
++                len(keys),
++                total_bytes,
++            )
++            # Drain THIS task before reserving the next batch's pages.
++            return self._wait_own_store_task(
++                adapter_index, (adapter_index, task_id)
++            )
++
++        abort = False
++        released: set = set()
++        for i in range(0, len(target_keys), _L2_STORE_RESERVE_SLICE):
++            if abort:
++                break
++            slice_keys = target_keys[i : i + _L2_STORE_RESERVE_SLICE]
++            read_results = l1_mgr.reserve_read(slice_keys)
++            for key in slice_keys:
+                 result = read_results.get(key)
+                 if result is None:
+                     continue
+@@ -780,85 +879,126 @@
+                         err,
+                     )
+                     continue
+-                successful_keys.append(key)
+-                successful_objs.append(obj)
+-
+-            # L1 read-failure anomaly reporting: target_keys come from an
+-            # L1_WRITE_FINISHED notification or a just-completed restore, so
+-            # failing to reserve_read them means an eviction or lock race.
+-            if not_found_keys:
+-                self._event_bus.publish(
+-                    Event(
+-                        event_type=EventType.L1_READ_FAILED,
+-                        metadata={
+-                            "during": "l2_store",
+-                            "reason": "not_found",
+-                            "keys": not_found_keys,
+-                        },
+-                    )
++                obj_bytes = obj.get_size()
++                if (
++                    batch_keys
++                    and batch_bytes + obj_bytes > _L2_STORE_BATCH_BYTES
++                ):
++                    if not flush_batch():
++                        # Stop flag or a stuck adapter: the unfinalized task
++                        # still holds read-pins; reserving more pages on top
++                        # would rebuild the unbounded pinning this batching
++                        # exists to prevent.
++                        abort = True
++                        break
++                batch_keys.append(key)
++                batch_objs.append(obj)
++                batch_bytes += obj_bytes
++        if abort:
++            # The unfinalized task keeps its own pins. The current slice's
++            # still-unsubmitted reservations must be released now, or their
++            # read-locks strand until restart. Keys already submitted by ANY
++            # flush of this call (``submitted``) are owned by their tasks —
++            # excluding them avoids double finish_read.
++            stranded = [
++                key
++                for key in slice_keys
++                if (res := read_results.get(key)) is not None
++                and res[0] == L1Error.SUCCESS
++                and res[1] is not None
++                and key not in submitted
++                and key not in released
++            ]
++            if stranded:
++                logger.warning(
++                    "Store batching aborted (adapter %d): releasing %d "
++                    "unsubmitted reservations.",
++                    adapter_index,
++                    len(stranded),
+                 )
+-            if write_locked_keys:
+-                self._event_bus.publish(
+-                    Event(
+-                        event_type=EventType.L1_READ_FAILED,
+-                        metadata={
+-                            "during": "l2_store",
+-                            "reason": "write_locked",
+-                            "keys": write_locked_keys,
+-                        },
+-                    )
+-                )
+-
+-            if not successful_keys:
+-                continue
+-
+-            adapter = self._l2_adapters[adapter_index]
+-            try:
+-                task_id = adapter.submit_store_task(successful_keys, successful_objs)
+-            except Exception:
+-                logger.exception(
+-                    "Failed to submit store task to adapter %d for %d keys.",
+-                    adapter_index,
+-                    len(successful_keys),
+-                )
+-                l1_mgr.finish_read(successful_keys)
+-                continue
+-            submitted.extend(successful_keys)
+-
+-            self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
+-                adapter_index=adapter_index,
+-                keys=successful_keys,
+-                read_locked_keys=list(successful_keys),
+-            )
+-            self._status_in_flight_count += 1
+-
+-            # All objects for a single store task share one layout (L1
+-            # allocates uniform MemoryObjs per chunk), so total bytes is
+-            # size * count — avoids summing N identical values.
+-            total_bytes = successful_objs[0].get_size() * len(successful_objs)
++                l1_mgr.finish_read(stranded)
++        flush_batch()
++
++        # L1 read-failure anomaly reporting: target_keys come from an
++        # L1_WRITE_FINISHED notification or a just-completed restore, so
++        # failing to reserve_read them means an eviction or lock race.
++        if not_found_keys:
+             self._event_bus.publish(
+                 Event(
+-                    event_type=EventType.L2_STORE_SUBMITTED,
++                    event_type=EventType.L1_READ_FAILED,
+                     metadata={
+-                        "adapter_index": adapter_index,
+-                        "task_id": task_id,
+-                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
+-                        "key_count": len(successful_keys),
+-                        "total_bytes": total_bytes,
+-                        "key_count_per_salt": Counter(
+-                            k.cache_salt for k in successful_keys
+-                        ),
++                        "during": "l2_store",
++                        "reason": "not_found",
++                        "keys": not_found_keys,
+                     },
+                 )
+             )
+-
+-            logger.debug(
+-                "Submitted store task %d to adapter %d with %d keys.",
+-                task_id,
+-                adapter_index,
+-                len(successful_keys),
++        if write_locked_keys:
++            self._event_bus.publish(
++                Event(
++                    event_type=EventType.L1_READ_FAILED,
++                    metadata={
++                        "during": "l2_store",
++                        "reason": "write_locked",
++                        "keys": write_locked_keys,
++                    },
++                )
+             )
+         return submitted
++
++    def _wait_own_store_task(
++        self, adapter_index: int, task_key: tuple[int, L2TaskId]
++    ) -> bool:
++        """Block until our store task finalizes (bounded inline drain).
++
++        Runs on the store-loop thread: the wait IS the backpressure — the
++        next batch's ``reserve_read`` must not pin pages on top of the
++        previous batch's still-pinned pages. Deposits outcomes via the
++        regular ``_drain_l2_store_completions`` path and finalizes via the
++        regular ``_advance_request`` path.
++
++        Returns True when the task finalized; False on stop or timeout —
++        the caller must NOT reserve further pages on top of the
++        unfinalized task's pins (they are released later by the regular
++        loop or by ``_cleanup_in_flight_tasks`` on stop)."""
++        deadline = time.monotonic() + _L2_STORE_WAIT_TIMEOUT_S
++        last_log = time.monotonic()
++        while True:
++            if self._stop_flag.is_set():
++                return False
++            self._drain_l2_store_completions({adapter_index})
++            task = self._in_flight_tasks.get(task_key)
++            if task is not None and task.l2_store_result is not None:
++                try:
++                    self._advance_request(task_key, task)
++                except Exception:
++                    logger.exception(
++                        "Finalizing store task %s (adapter %d) failed; "
++                        "leaving it for the regular loop.",
++                        task_key[1],
++                        adapter_index,
++                    )
++                    return False
++                return True
++            now = time.monotonic()
++            if now > deadline:
++                logger.error(
++                    "L2 store task %s (adapter %d) did not complete in %ds; "
++                    "leaving it in-flight (backpressure degraded, the store "
++                    "loop will drain it later).",
++                    task_key[1],
++                    adapter_index,
++                    _L2_STORE_WAIT_TIMEOUT_S,
++                )
++                return False
++            if now - last_log > 30:
++                logger.warning(
++                    "Still waiting for L2 store task %s (adapter %d) to drain.",
++                    task_key[1],
++                    adapter_index,
++                )
++                last_log = now
++            time.sleep(0.05)
+ 
+     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
+         """Deposit each signaled adapter's L2 outcomes onto their in-flight

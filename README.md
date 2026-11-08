@@ -81,6 +81,32 @@ offloading connector at request boundaries.
    [diff](diffs/20261108-kvfix-restore-drain.diff),
    [file](files/lmcache/checkpoint_copy.py)
 
+   → [docs/kvfix-restore-pipeline.md](docs/kvfix-restore-pipeline.md),
+   [diff](diffs/20261108-kvfix-restore-drain.diff),
+   [file](files/lmcache/checkpoint_copy.py)
+
+6. **L2 store batching — burst-pin OOM closed.** With `checkpoint_on_evict`
+   the store loop reserved (read-pinned) the **entire eviction burst in SHM
+   at once** — no data copies exist, the fs adapter writes O_DIRECT from SHM
+   views — so pinned burst + live L1 + new store pages grew past the
+   container's memcg and killed the cache twice (`Exit 137`) during ordinary
+   churn, while L2 kept receiving data. Fix: `_submit_bounded_batches` —
+   reserve in 8-key slices, accumulate to 2 GiB per store task, and a
+   blocking inline drain on the store-loop thread between batches (the wait
+   is the backpressure: the next batch cannot pin pages on top of the
+   previous batch's pins); stop-flag first line, `_advance_request` guarded,
+   wait-failure does not reserve the remainder, `submitted` is the single
+   pin ledger, submit-failed keys stay re-storable. Deployment note: with a
+   fully pre-fallocated pool keep the container limit at pool + ≥6 GiB
+   (non-reclaimable overhead ≈ 2.1 GiB measured at OOM time).
+   **Status: live in production since 09.11** (image on the battle cache +
+   engine; acceptance green; burst soak: 13 eviction loops, 47 GB to L2,
+   zero OOM, zero losses; colds during evictions 33–48 s vs 93–116 s
+   dead-cache era).
+   → [docs/l2stream-store-batching.md](docs/l2stream-store-batching.md),
+   [diff](diffs/20261109-l2stream-store-batching.diff),
+   [file](files/lmcache/store_controller.py)
+
 ## Upstream
 
 - **[vllm#64312](https://github.com/vllm-project/vllm/pull/64312)** (merged 03.11)

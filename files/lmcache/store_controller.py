@@ -1,0 +1,1137 @@
+# SPDX-License-Identifier: Apache-2.0
+"""
+Store Controller: asynchronously copies data from L1 to L2 after writes complete.
+
+The controller runs a background thread with an event-driven loop that:
+1. Listens for L1 write-completion events via StoreListener.
+2. Submits store tasks to L2 adapters based on StorePolicy decisions.
+3. Monitors L2 task completion via event fds.
+4. Releases L1 read locks and optionally deletes keys from L1.
+"""
+
+# Standard
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass
+import enum
+import select
+import threading
+import time
+import weakref
+
+# First Party
+from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.internal_api import (
+    L1ManagerInterface,
+    L1ManagerListener,
+    L2AdapterListener,
+)
+from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.storage_controller import StorageControllerInterface
+from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
+    AddAdapterOp,
+    RemoveAdapterOp,
+)
+from lmcache.v1.distributed.storage_controllers.store_policy import (
+    AdapterDescriptor,
+    StorePolicy,
+)
+from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.otel_init import register_gauge
+from lmcache.v1.platform import (
+    consume_fd,
+    create_event_notifier,
+)
+
+logger = init_logger(__name__)
+
+# Poll timeout in milliseconds for the store loop
+STORE_LOOP_POLL_TIMEOUT_MS = 500
+
+
+def _group_keys_by_shape(
+    keys: list[ObjectKey],
+) -> dict[tuple, list[ObjectKey]]:
+    """Group ``keys`` by the fields that determine their KV cache shape.
+
+    Each bucket shares a single ``(shape, dtype)``, so each bucket can be
+    submitted as one ``submit_store_task`` call. Today the shape is pinned
+    by ``(model_name, kv_rank)`` — ``kv_rank`` packs ``world_size`` and
+    parallelism config, so different TP/PP setups land in different
+    buckets. Extend the grouping tuple when a new shape-affecting field is
+    added to ``ObjectKey``.
+    """
+    groups: dict[tuple, list[ObjectKey]] = defaultdict(list)
+    for key in keys:
+        groups[(key.model_name, key.kv_rank)].append(key)
+    return groups
+
+
+# Helper classes (module-level, before main class)
+
+
+class L2Residency(enum.Enum):
+    """Whether an event shows that keys are in L2 or no longer are."""
+
+    PRESENT = enum.auto()
+    ABSENT = enum.auto()
+
+
+class StoreListener(L1ManagerListener, L2AdapterListener):
+    """
+    Listener that receives L1 write-completion callbacks and enqueues
+    keys for the StoreController's background loop.
+
+    The ``on_keys_write_finished`` callback is invoked inside L1Manager's
+    lock, so it must be non-blocking. It appends keys to an internal list
+    and signals an eventfd to wake up the controller's select.poll().
+
+    For reuse-admission policies it also queues reused keys and records
+    which keys enter or leave L2 (loads from L2, L2 stores and deletions),
+    so the controller stores a reused key once rather than on every reuse.
+    """
+
+    def __init__(self) -> None:
+        self._pending_keys: list[ObjectKey] = []
+        self._reused_keys: list[ObjectKey] = []
+        self._residency_events: list[tuple[L2Residency, list[ObjectKey]]] = []
+        self._tracks_l2_residency = False
+        self._lock = threading.Lock()
+        self._event_fd = create_event_notifier()
+
+    def get_event_fd(self) -> int:
+        """
+        Return the notifier fd that is signaled when new keys are
+        available.
+
+        Returns:
+            int: The readable file descriptor for poller registration.
+        """
+        return self._event_fd.fileno()
+
+    def notify(self) -> None:
+        """Signal the notifier to wake any blocked poll() waiter."""
+        self._event_fd.notify()
+
+    def pop_pending_keys(self) -> list[ObjectKey]:
+        """
+        Pop all pending keys from the queue.
+
+        This is non-blocking and should be called by the StoreController's
+        main loop after select.poll() indicates the eventfd is ready.
+
+        Returns:
+            list[ObjectKey]: All keys enqueued since the last pop.
+        """
+        with self._lock:
+            keys = self._pending_keys
+            self._pending_keys = []
+        return keys
+
+    def pending_count(self) -> int:
+        """Return the number of pending keys waiting to be processed."""
+        with self._lock:
+            return len(self._pending_keys)
+
+    def pending_reused_count(self) -> int:
+        """Return the number of reused keys waiting to be processed."""
+        with self._lock:
+            return len(self._reused_keys)
+
+    def enable_l2_residency_tracking(self) -> None:
+        """Start recording L2 residency events and accepting reused keys."""
+        with self._lock:
+            self._tracks_l2_residency = True
+
+    def enqueue_reused_keys(self, keys: list[ObjectKey]) -> None:
+        """
+        Enqueue keys read by a completed restore and signal the notifier.
+
+        Ignored until ``enable_l2_residency_tracking`` is called.
+
+        Args:
+            keys (list[ObjectKey]): Keys whose restore has completed.
+        """
+        with self._lock:
+            if not self._tracks_l2_residency:
+                return
+            self._reused_keys.extend(keys)
+        self._event_fd.notify()
+
+    def pop_reuse_events(
+        self,
+    ) -> tuple[list[tuple[L2Residency, list[ObjectKey]]], list[ObjectKey]]:
+        """
+        Pop residency events and reused keys in one atomic step.
+
+        A key loaded from L2 is recorded before its restore can complete,
+        so popping both lists together never returns a reused key without
+        the residency event that precedes it.
+
+        Returns:
+            Residency events in arrival order, and the reused keys.
+        """
+        with self._lock:
+            residency, reused = self._residency_events, self._reused_keys
+            self._residency_events, self._reused_keys = [], []
+        return residency, reused
+
+    # L1ManagerListener implementation
+
+    def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
+        """
+        Enqueue keys and signal the notifier.
+
+        Called inside L1Manager's lock. Must be fast and must not
+        call any L1Manager methods (would deadlock).
+
+        Args:
+            keys (list[ObjectKey]): Keys that finished writing.
+        """
+        with self._lock:
+            self._pending_keys.extend(keys)
+        self._event_fd.notify()
+
+    def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_read_finished(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_reserved_write(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
+        # Never trigger a store for objects prefetched to L1; they came from
+        # L2, so reuse admission records them as already stored.
+        self._record_residency(L2Residency.PRESENT, keys)
+
+    def on_l1_keys_accessed(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    # L2AdapterListener implementation
+
+    def on_l2_keys_stored(self, keys: list[ObjectKey], sizes: list[int]) -> None:
+        """Record keys that an L2 adapter now holds."""
+        self._record_residency(L2Residency.PRESENT, keys)
+
+    def on_l2_keys_accessed(self, keys: list[ObjectKey]) -> None:
+        pass
+
+    def on_l2_keys_deleted(self, keys: list[ObjectKey]) -> None:
+        """Record keys that an L2 adapter no longer holds."""
+        self._record_residency(L2Residency.ABSENT, keys)
+
+    def close(self) -> None:
+        """Close the notifier."""
+        self._event_fd.close()
+
+    def _record_residency(self, state: L2Residency, keys: list[ObjectKey]) -> None:
+        """Queue a residency change when tracking is enabled; non-blocking."""
+        if not keys:
+            return
+        with self._lock:
+            if not self._tracks_l2_residency:
+                return
+            self._residency_events.append((state, list(keys)))
+        self._event_fd.notify()
+
+
+class StorePhase(enum.Enum):
+    """Phases a store task may be in. Currently there is only an
+    L2_STORE phase; new phases (e.g. verify, ack) would be added here and
+    threaded through ``signaled_adapters`` without changing
+    ``_advance_request``'s signature."""
+
+    L2_STORE = enum.auto()
+
+
+@dataclass
+class InFlightStoreTask:
+    """
+    Tracks a single submitted L2 store task so the controller can
+    release L1 read locks and perform cleanup when it completes.
+    """
+
+    adapter_index: int
+    """Which L2 adapter this task was submitted to."""
+
+    keys: list[ObjectKey]
+    """All keys that were submitted in this store task."""
+
+    read_locked_keys: list[ObjectKey]
+    """The subset of keys for which reserve_read succeeded
+    (i.e., keys holding an L1 read lock that must be released)."""
+
+    l2_store_result: bool | None = None
+    """L2 outcome (True=success, False=failure, None=still in flight)."""
+
+    l2_bytes_transferred: int = 0
+    """Bytes actually transferred by the adapter for this task."""
+
+
+# Main class
+
+
+# L2 store batching: the read-pins of an eviction burst are taken at
+# reserve_read time; without a cap the whole burst stays pinned in SHM
+# until one giant NVMe write drains, over-committing the container's
+# memcg (OOM 07.11/08.11). Batches release pins in portions.
+_L2_STORE_BATCH_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB per store task
+_L2_STORE_RESERVE_SLICE = 8                     # keys reserved per step
+_L2_STORE_WAIT_TIMEOUT_S = 600                  # bounded inline drain
+
+
+class StoreController(StorageControllerInterface):
+    """
+    Asynchronously stores L1 data to L2 adapters after write completion.
+
+    The controller:
+    1. Registers a StoreListener with L1Manager to receive
+       on_keys_write_finished callbacks.
+    2. Runs a background thread with an event-driven loop using
+       select.poll() on the listener eventfd and all L2 adapter
+       store eventfds.
+    3. On new keys: consults StorePolicy to decide targets,
+       calls reserve_read to get MemoryObjs, and submits store
+       tasks to L2 adapters.
+    4. On L2 task completion: releases read locks, optionally
+       deletes keys from L1 per policy.
+
+    Args:
+        l1_manager: The L1 manager instance.
+        l2_adapters: List of L2 adapter instances.
+        adapter_descriptors: Descriptors for each L2 adapter (same order).
+        policy: The store policy for deciding targets and deletions.
+    """
+
+    # Singleton dispatch for ``lmcache_mp.num_inflight_l2_stores``: tests may
+    # construct multiple controllers but the OTel SDK only honors the first
+    # gauge registration, so the callback reads from the most recently built
+    # instance via ``_gauge_target``.
+    _gauge_registered: bool = False
+    _gauge_target: "StoreController | None" = None
+    _gauge_targets: weakref.WeakValueDictionary[str, "StoreController"] = (
+        weakref.WeakValueDictionary()
+    )
+
+    # Bound on remembered L2-resident keys for reuse admission. A forgotten
+    # key that is still in L2 is stored once more on its next reuse.
+    _MAX_TRACKED_L2_KEYS = 131072
+
+    def __init__(
+        self,
+        l1_manager: L1ManagerInterface,
+        l2_adapters: list[L2AdapterInterface],
+        adapter_descriptors: list[L2AdapterDescriptor],
+        policy: StorePolicy,
+    ) -> None:
+        self._l1_manager = l1_manager
+        self._l2_adapters: dict[int, L2AdapterInterface] = {
+            desc.index: adapter
+            for desc, adapter in zip(adapter_descriptors, l2_adapters, strict=True)
+        }
+        self._adapter_descriptors: dict[int, L2AdapterDescriptor] = {
+            desc.index: desc for desc in adapter_descriptors
+        }
+        self._policy = policy
+
+        # Reuse admission state, touched only by the store loop thread.
+        self._tracks_l2_residency = policy.uses_reuse_admission()
+        self._l2_resident: OrderedDict[ObjectKey, None] = OrderedDict()
+        self._reuse_in_flight: set[ObjectKey] = set()
+
+        # Adapters that are being drained and will be removed after all
+        # the in-flight operations are done.
+        self._draining: dict[int, threading.Event] = {}
+
+        # Control-plane queue for runtime add/remove, used by the internal
+        # loop thread
+        self._adapter_ops_lock = threading.Lock()
+        self._pending_adapter_ops: list[AddAdapterOp | RemoveAdapterOp] = []
+        self._adapter_ctrl_efd = create_event_notifier()
+
+        self._listener = StoreListener()
+        self._l1_manager.register_listener(self._listener)
+        if self._tracks_l2_residency:
+            self._listener.enable_l2_residency_tracking()
+            for adapter in self._l2_adapters.values():
+                adapter.register_listener(self._listener)
+        self._event_bus = get_event_bus()
+
+        # (adapter_index, task_id) -> InFlightStoreTask
+        # Composite key is needed because task IDs are only unique
+        # within a single adapter, not across adapters.
+        self._in_flight_tasks: dict[tuple[int, L2TaskId], InFlightStoreTask] = {}
+        # Stored keys whose L1 deletion was refused because a reader held them.
+        # Only the store loop thread changes these.
+        self._deferred_l1_deletions: set[ObjectKey] = set()
+        self._last_l1_deletion_retry = 0.0
+
+        # Shadow counter for status reporting (updated in background loop)
+        self._status_in_flight_count: int = 0
+
+        StoreController._gauge_target = self
+        StoreController._gauge_targets[l1_manager.config.tag] = self
+        if not StoreController._gauge_registered:
+            StoreController._gauge_registered = True
+            register_gauge(
+                "lmcache.l2_store",
+                "lmcache_mp.num_inflight_l2_stores",
+                "L2 store tasks currently executing, per adapter",
+                lambda: [
+                    observation
+                    for c in list(StoreController._gauge_targets.values())
+                    for observation in c.get_inflight_stores_observations()
+                ],
+            )
+            register_gauge(
+                "lmcache.l2_store",
+                "lmcache_mp.l2_store_adapters",
+                (
+                    "Count of L2 adapters attached to the store controller, "
+                    "tagged by ``state`` (active or draining)."
+                ),
+                lambda: [
+                    (count, {**attrs, "l1_tag": tag})
+                    for tag, c in list(StoreController._gauge_targets.items())
+                    for count, attrs in c.get_adapter_state_observations()
+                ],
+            )
+
+        # Map store eventfd -> adapter id for quick lookup in poll results
+        self._efd_to_adapter_index: dict[int, int] = {}
+        for adapter_id, adapter in self._l2_adapters.items():
+            self._efd_to_adapter_index[adapter.get_store_event_fd()] = adapter_id
+
+        self._stop_flag = threading.Event()
+        self._thread = threading.Thread(
+            target=self._store_loop,
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        """Start the background store loop thread."""
+        logger.info("Starting StoreController...")
+        self._thread.start()
+
+    def stop(self) -> None:
+        """
+        Signal the loop to stop, wait for the thread to join.
+
+        Releases all in-flight read locks on shutdown so that
+        L1 objects are not permanently locked.
+        """
+        self._stop_flag.set()
+        # Wake up the poll loop so it can exit promptly
+        self._listener.notify()
+        self._thread.join()
+        self._cleanup_in_flight_tasks()
+        self._listener.close()
+        self._adapter_ctrl_efd.close()
+        if StoreController._gauge_targets.get(self._l1_manager.config.tag) is self:
+            del StoreController._gauge_targets[self._l1_manager.config.tag]
+
+    def report_status(self) -> dict:
+        """Return a status dict for the store controller."""
+        is_healthy = self._thread.is_alive()
+        num_draining = len(self._draining)
+        return {
+            "is_healthy": is_healthy,
+            "thread_alive": is_healthy,
+            "pending_keys_count": self._listener.pending_count(),
+            "pending_reused_keys_count": self._listener.pending_reused_count(),
+            "in_flight_task_count": self._status_in_flight_count,
+            "num_l2_adapters": len(self._l2_adapters),
+            "num_active_adapters": len(self._l2_adapters) - num_draining,
+            "num_draining_adapters": num_draining,
+            "deferred_l1_deletion_count": len(self._deferred_l1_deletions),
+        }
+
+    def submit_reused_keys(self, keys: list[ObjectKey]) -> None:
+        """
+        Report keys that a completed restore read from L1.
+
+        With a reuse-admission policy, keys not yet known to be in L2 are
+        offered to ``StorePolicy.select_reuse_targets`` by the background
+        loop. Other policies ignore the report. Non-blocking.
+
+        Args:
+            keys: Keys whose restore, including the consumer's copy, has
+                completed.
+        """
+        if keys:
+            self._listener.enqueue_reused_keys(keys)
+
+    def add_adapter(
+        self,
+        adapter_id: int,
+        adapter: L2AdapterInterface,
+        descriptor: L2AdapterDescriptor,
+    ) -> None:
+        """Blocking function to add a new adapter into the store controller
+        with the specified adapter ID and descriptor.
+
+        Args:
+            adapter_id: Stable id assigned by the StorageManager.
+            adapter: The adapter instance to attach.
+            descriptor: The adapter's descriptor (``descriptor.index`` must
+                equal ``adapter_id``).
+
+        Raises:
+            RuntimeError: If the background loop did not apply the op in
+                time (e.g. the loop is not running).
+        """
+        op = AddAdapterOp(
+            adapter_id=adapter_id,
+            adapter=adapter,
+            descriptor=descriptor,
+            done=threading.Event(),
+        )
+        with self._adapter_ops_lock:
+            self._pending_adapter_ops.append(op)
+        self._adapter_ctrl_efd.notify()
+        if not op.done.wait(timeout=STORE_LOOP_POLL_TIMEOUT_MS / 1000 + 5.0):
+            raise RuntimeError(
+                f"StoreController did not attach adapter {adapter_id} in time"
+            )
+
+    def request_remove_adapter(self, adapter_id: int) -> threading.Event:
+        """Non-blocking function to request the removal of a L2 adapter
+        specified by the adapter ID.
+
+        New store tasks stop routing to the adapter immediately; in-flight
+        tasks are allowed to complete.
+
+        Args:
+            adapter_id: Stable id of the adapter to drain.
+
+        Returns:
+            An Event signaled when the adapter is fully drained.
+        """
+        op = RemoveAdapterOp(adapter_id=adapter_id, done=threading.Event())
+        with self._adapter_ops_lock:
+            self._pending_adapter_ops.append(op)
+        self._adapter_ctrl_efd.notify()
+        return op.done
+
+    def get_adapter_state_observations(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """``(count, {"state": ...})`` tuples for the ``lmcache_mp.l2_adapters``
+        gauge. ``len()`` reads are GIL-atomic, safe from the OTel thread."""
+        num_draining = len(self._draining)
+        return [
+            (len(self._l2_adapters) - num_draining, {"state": "active"}),
+            (num_draining, {"state": "draining"}),
+        ]
+
+    def get_inflight_stores_observations(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Per-adapter ``(count, attributes)`` snapshot for the
+        ``lmcache_mp.num_inflight_l2_stores`` gauge.
+
+        ``dict.copy()`` is GIL-atomic in CPython, so reading from the
+        OTel reader thread while the store loop mutates is safe; the
+        snapshot may be one mutation stale, which is fine at the 10 s
+        scrape cadence.
+        """
+        counts: dict[int, int] = defaultdict(int)
+        for adapter_index, _ in self._in_flight_tasks.copy():
+            counts[adapter_index] += 1
+        observations: list[tuple[int | float, dict[str, object]]] = []
+        for idx, count in counts.items():
+            # A just-finalized adapter may be gone from the descriptor map
+            # while a stale in-flight snapshot still references it; skip it
+            # rather than KeyError on the OTel reader thread.
+            desc = self._adapter_descriptors.get(idx)
+            if desc is None:
+                continue
+            observations.append(
+                (count, {"l2_name": desc.type_name, "adapter_index": idx})
+            )
+        return observations
+
+    # Private methods
+
+    def _store_loop(self) -> None:
+        """
+        Main event-driven loop running in a background thread.
+
+        Uses select.poll() to wait on:
+        - The StoreListener's eventfd (new keys from L1 writes).
+        - Each L2 adapter's store eventfd (completed store tasks).
+
+        Exits when the stop flag is set.
+        """
+        poller = select.poll()
+
+        listener_efd = self._listener.get_event_fd()
+        poller.register(listener_efd, select.POLLIN)
+        poller.register(self._adapter_ctrl_efd.fileno(), select.POLLIN)
+
+        for efd in self._efd_to_adapter_index:
+            poller.register(efd, select.POLLIN)
+
+        while not self._stop_flag.is_set():
+            # First, apply runtime add/remove of the L2 adapters.
+            self._apply_pending_adapter_ops(poller)
+
+            ready = poller.poll(STORE_LOOP_POLL_TIMEOUT_MS)
+
+            signaled_adapters: dict[StorePhase, set[int]] = {
+                phase: set() for phase in StorePhase
+            }
+            for fd, events in ready:
+                if not (events & select.POLLIN):
+                    continue
+
+                # Consume the notifier value
+                try:
+                    consume_fd(fd)
+                except (OSError, BlockingIOError):
+                    pass
+
+                try:
+                    if fd == listener_efd:
+                        keys = self._listener.pop_pending_keys()
+                        if keys:
+                            self._process_new_keys(keys)
+                        self._process_reuse_events()
+                    else:
+                        adapter_idx = self._efd_to_adapter_index.get(fd)
+                        if adapter_idx is not None:
+                            signaled_adapters[StorePhase.L2_STORE].add(adapter_idx)
+                except Exception:
+                    logger.exception(
+                        "Unexpected error in store loop while processing fd %d",
+                        fd,
+                    )
+
+            if any(signaled_adapters.values()):
+                try:
+                    self._drain_l2_store_completions(
+                        signaled_adapters[StorePhase.L2_STORE]
+                    )
+                except Exception:
+                    logger.exception("Unexpected error draining L2 store completions")
+                for task_key, task in list(self._in_flight_tasks.items()):
+                    try:
+                        self._advance_request(task_key, task)
+                    except Exception:
+                        logger.exception(
+                            "Unexpected error advancing in-flight store task "
+                            "(adapter %d, task %d)",
+                            task_key[0],
+                            task_key[1],
+                        )
+
+            # Finalize any draining adapter no longer have any in-flight
+            # tasks.
+            self._finalize_drained_adapters(poller)
+
+            try:
+                self._retry_deferred_l1_deletions()
+            except Exception:
+                logger.exception("Unexpected error retrying deferred L1 deletions")
+
+    def _apply_pending_adapter_ops(self, poller: "select.poll") -> None:
+        """Apply queued add/remove ops on the store loop thread."""
+        with self._adapter_ops_lock:
+            ops = self._pending_adapter_ops
+            self._pending_adapter_ops = []
+        for op in ops:
+            if isinstance(op, AddAdapterOp):
+                if self._tracks_l2_residency:
+                    op.adapter.register_listener(self._listener)
+                self._l2_adapters[op.adapter_id] = op.adapter
+                self._adapter_descriptors[op.adapter_id] = op.descriptor
+                efd = op.adapter.get_store_event_fd()
+                self._efd_to_adapter_index[efd] = op.adapter_id
+                poller.register(efd, select.POLLIN)
+                logger.info("StoreController attached adapter %d", op.adapter_id)
+                op.done.set()
+            elif isinstance(op, RemoveAdapterOp):
+                if op.adapter_id not in self._l2_adapters:
+                    # Already gone (double remove); signal so the caller
+                    # doesn't block.
+                    op.done.set()
+                    continue
+                # Mark draining; routing skips it immediately. The adapter
+                # stays registered so in-flight completions still process.
+                self._draining[op.adapter_id] = op.done
+                logger.info(
+                    "StoreController draining adapter %d (no new stores routed)",
+                    op.adapter_id,
+                )
+
+    def _adapter_in_use(self, adapter_id: int) -> bool:
+        """True if any in-flight store task targets ``adapter_id``."""
+        for task_adapter_id, _ in self._in_flight_tasks:
+            if task_adapter_id == adapter_id:
+                return True
+        return False
+
+    def _finalize_drained_adapters(self, poller: "select.poll") -> None:
+        """Detach draining adapters that no longer have in-flight tasks."""
+        for adapter_id in list(self._draining):
+            if self._adapter_in_use(adapter_id):
+                continue
+            adapter = self._l2_adapters.pop(adapter_id)
+            self._adapter_descriptors.pop(adapter_id, None)
+            efd = adapter.get_store_event_fd()
+            self._efd_to_adapter_index.pop(efd, None)
+            try:
+                poller.unregister(efd)
+            except (KeyError, OSError):
+                pass
+            done = self._draining.pop(adapter_id)
+            logger.info("StoreController detached adapter %d", adapter_id)
+            done.set()
+
+    def _process_new_keys(self, keys: list[ObjectKey]) -> None:
+        """
+        Process a batch of newly written keys.
+
+        1. Ask the policy which adapters each key should go to.
+        2. For each adapter target, reserve read access on L1 to get
+           MemoryObj references (skip keys that fail — best-effort).
+        3. Submit store tasks to L2 adapters.
+        4. Track in-flight tasks for later cleanup.
+
+        Args:
+            keys (list[ObjectKey]): Keys that finished writing to L1.
+        """
+
+        # A rewritten key is deleted again once its own store finishes.
+        self._deferred_l1_deletions.difference_update(keys)
+        for group in _group_keys_by_shape(keys).values():
+            self._submit_store_for_single_shape(group)
+
+    def _process_reuse_events(self) -> None:
+        """Apply L2 residency changes, then store keys reused for the first time."""
+        residency, reused = self._listener.pop_reuse_events()
+        for state, keys in residency:
+            if state is L2Residency.PRESENT:
+                self._remember_l2_resident(keys)
+            else:
+                for key in keys:
+                    self._l2_resident.pop(key, None)
+        fresh = [
+            key
+            for key in dict.fromkeys(reused)
+            if key not in self._l2_resident and key not in self._reuse_in_flight
+        ]
+        for group in _group_keys_by_shape(fresh).values():
+            plan = self._policy.select_reuse_targets(group, self._routing_descriptors())
+            self._reuse_in_flight.update(self._submit_plan(plan))
+
+    def _routing_descriptors(self) -> list[AdapterDescriptor]:
+        """Return descriptors of live adapters that may receive new stores."""
+        # Descriptors for draining adapters are kept for in-flight completion
+        # handling but excluded here so no new task targets them.
+        return [
+            desc
+            for adapter_id, desc in self._adapter_descriptors.items()
+            if adapter_id not in self._draining
+        ]
+
+    def _submit_store_for_single_shape(self, keys: list[ObjectKey]) -> None:
+        """Submit ``keys`` (all same shape) to their target adapters."""
+        plan = self._policy.select_store_targets(keys, self._routing_descriptors())
+        self._submit_plan(plan)
+
+    def _submit_plan(self, plan: dict[int, list[ObjectKey]]) -> list[ObjectKey]:
+        """Submit store tasks per adapter in byte-capped batches.
+
+        Each batch's store completes before the next batch's pages are
+        reserved: the read-pins are taken at ``reserve_read`` time, so
+        queuing a whole eviction burst would pin it entirely in SHM until
+        one giant sequential NVMe write drains — that unbounded pinning,
+        stacked on top of live L1 pages, is what over-committed the
+        container's memcg (OOM 07.11/08.11)."""
+        submitted: list[ObjectKey] = []
+
+        for adapter_index, target_keys in plan.items():
+            if not target_keys:
+                continue
+
+            if adapter_index not in self._l2_adapters:
+                logger.error(
+                    "StorePolicy returned invalid adapter id %d "
+                    "(not among attached adapters). Skipping.",
+                    adapter_index,
+                )
+                continue
+
+            submitted.extend(
+                self._submit_bounded_batches(adapter_index, target_keys)
+            )
+        return submitted
+
+    def _submit_bounded_batches(
+        self, adapter_index: int, target_keys: list[ObjectKey]
+    ) -> list[ObjectKey]:
+        """Reserve and submit ``target_keys`` in byte-capped batches with an
+        inline completion wait between batches."""
+        l1_mgr = self._l1_manager
+        adapter = self._l2_adapters[adapter_index]
+        submitted: list[ObjectKey] = []
+        not_found_keys: list[ObjectKey] = []
+        write_locked_keys: list[ObjectKey] = []
+
+        batch_keys: list[ObjectKey] = []
+        batch_objs = []
+        batch_bytes = 0
+
+        def flush_batch() -> bool:
+            """Submit the accumulated batch and drain it. Returns False when
+            the wait failed (stop flag or timeout) — the caller must stop
+            reserving further pages on top of the unfinalized pins."""
+            nonlocal batch_keys, batch_objs, batch_bytes, released
+            if not batch_keys:
+                return True
+            keys, objs = batch_keys, batch_objs
+            batch_keys, batch_objs, batch_bytes = [], [], 0
+            try:
+                task_id = adapter.submit_store_task(keys, objs)
+            except Exception:
+                logger.exception(
+                    "Failed to submit store task to adapter %d for %d keys.",
+                    adapter_index,
+                    len(keys),
+                )
+                l1_mgr.finish_read(keys)
+                # The keys' pins are released synchronously; they must not
+                # re-enter ``stranded`` on a later abort of this call (and
+                # must stay out of ``submitted`` so they remain re-storable).
+                released.update(keys)
+                return True
+            submitted.extend(keys)
+
+            self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
+                adapter_index=adapter_index,
+                keys=keys,
+                read_locked_keys=list(keys),
+            )
+            self._status_in_flight_count += 1
+
+            # All objects for a single store task share one layout (L1
+            # allocates uniform MemoryObjs per chunk), so total bytes is
+            # size * count — avoids summing N identical values.
+            total_bytes = objs[0].get_size() * len(objs)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_STORE_SUBMITTED,
+                    metadata={
+                        "adapter_index": adapter_index,
+                        "task_id": task_id,
+                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
+                        "key_count": len(keys),
+                        "total_bytes": total_bytes,
+                        "key_count_per_salt": Counter(
+                            k.cache_salt for k in keys
+                        ),
+                    },
+                )
+            )
+
+            logger.debug(
+                "Submitted store task %d to adapter %d with %d keys (%d bytes).",
+                task_id,
+                adapter_index,
+                len(keys),
+                total_bytes,
+            )
+            # Drain THIS task before reserving the next batch's pages.
+            return self._wait_own_store_task(
+                adapter_index, (adapter_index, task_id)
+            )
+
+        abort = False
+        released: set = set()
+        for i in range(0, len(target_keys), _L2_STORE_RESERVE_SLICE):
+            if abort:
+                break
+            slice_keys = target_keys[i : i + _L2_STORE_RESERVE_SLICE]
+            read_results = l1_mgr.reserve_read(slice_keys)
+            for key in slice_keys:
+                result = read_results.get(key)
+                if result is None:
+                    continue
+                err, obj = result
+                if err != L1Error.SUCCESS or obj is None:
+                    if err == L1Error.KEY_NOT_EXIST:
+                        not_found_keys.append(key)
+                    elif err == L1Error.KEY_NOT_READABLE:
+                        write_locked_keys.append(key)
+                    logger.debug(
+                        "Skipping key %s for L2 store (adapter %d): %s",
+                        key,
+                        adapter_index,
+                        err,
+                    )
+                    continue
+                obj_bytes = obj.get_size()
+                if (
+                    batch_keys
+                    and batch_bytes + obj_bytes > _L2_STORE_BATCH_BYTES
+                ):
+                    if not flush_batch():
+                        # Stop flag or a stuck adapter: the unfinalized task
+                        # still holds read-pins; reserving more pages on top
+                        # would rebuild the unbounded pinning this batching
+                        # exists to prevent.
+                        abort = True
+                        break
+                batch_keys.append(key)
+                batch_objs.append(obj)
+                batch_bytes += obj_bytes
+        if abort:
+            # The unfinalized task keeps its own pins. The current slice's
+            # still-unsubmitted reservations must be released now, or their
+            # read-locks strand until restart. Keys already submitted by ANY
+            # flush of this call (``submitted``) are owned by their tasks —
+            # excluding them avoids double finish_read.
+            stranded = [
+                key
+                for key in slice_keys
+                if (res := read_results.get(key)) is not None
+                and res[0] == L1Error.SUCCESS
+                and res[1] is not None
+                and key not in submitted
+                and key not in released
+            ]
+            if stranded:
+                logger.warning(
+                    "Store batching aborted (adapter %d): releasing %d "
+                    "unsubmitted reservations.",
+                    adapter_index,
+                    len(stranded),
+                )
+                l1_mgr.finish_read(stranded)
+        flush_batch()
+
+        # L1 read-failure anomaly reporting: target_keys come from an
+        # L1_WRITE_FINISHED notification or a just-completed restore, so
+        # failing to reserve_read them means an eviction or lock race.
+        if not_found_keys:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_READ_FAILED,
+                    metadata={
+                        "during": "l2_store",
+                        "reason": "not_found",
+                        "keys": not_found_keys,
+                    },
+                )
+            )
+        if write_locked_keys:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L1_READ_FAILED,
+                    metadata={
+                        "during": "l2_store",
+                        "reason": "write_locked",
+                        "keys": write_locked_keys,
+                    },
+                )
+            )
+        return submitted
+
+    def _wait_own_store_task(
+        self, adapter_index: int, task_key: tuple[int, L2TaskId]
+    ) -> bool:
+        """Block until our store task finalizes (bounded inline drain).
+
+        Runs on the store-loop thread: the wait IS the backpressure — the
+        next batch's ``reserve_read`` must not pin pages on top of the
+        previous batch's still-pinned pages. Deposits outcomes via the
+        regular ``_drain_l2_store_completions`` path and finalizes via the
+        regular ``_advance_request`` path.
+
+        Returns True when the task finalized; False on stop or timeout —
+        the caller must NOT reserve further pages on top of the
+        unfinalized task's pins (they are released later by the regular
+        loop or by ``_cleanup_in_flight_tasks`` on stop)."""
+        deadline = time.monotonic() + _L2_STORE_WAIT_TIMEOUT_S
+        last_log = time.monotonic()
+        while True:
+            if self._stop_flag.is_set():
+                return False
+            self._drain_l2_store_completions({adapter_index})
+            task = self._in_flight_tasks.get(task_key)
+            if task is not None and task.l2_store_result is not None:
+                try:
+                    self._advance_request(task_key, task)
+                except Exception:
+                    logger.exception(
+                        "Finalizing store task %s (adapter %d) failed; "
+                        "leaving it for the regular loop.",
+                        task_key[1],
+                        adapter_index,
+                    )
+                    return False
+                return True
+            now = time.monotonic()
+            if now > deadline:
+                logger.error(
+                    "L2 store task %s (adapter %d) did not complete in %ds; "
+                    "leaving it in-flight (backpressure degraded, the store "
+                    "loop will drain it later).",
+                    task_key[1],
+                    adapter_index,
+                    _L2_STORE_WAIT_TIMEOUT_S,
+                )
+                return False
+            if now - last_log > 30:
+                logger.warning(
+                    "Still waiting for L2 store task %s (adapter %d) to drain.",
+                    task_key[1],
+                    adapter_index,
+                )
+                last_log = now
+            time.sleep(0.05)
+
+    def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
+        """Deposit each signaled adapter's L2 outcomes onto their in-flight
+        tasks, to be consumed by ``_advance_request``."""
+        for adapter_index in signaled_adapters:
+            adapter = self._l2_adapters[adapter_index]
+            completed = adapter.pop_completed_store_tasks()
+            for task_id, result in completed.items():
+                task = self._in_flight_tasks.get((adapter_index, task_id))
+                if task is None:
+                    logger.warning(
+                        "Completed store task %d (adapter %d) not found in tracking.",
+                        task_id,
+                        adapter_index,
+                    )
+                    continue
+                task.l2_store_result = result.is_successful()
+                task.l2_bytes_transferred = result.bytes_transferred()
+
+    def _advance_request(
+        self,
+        task_key: tuple[int, L2TaskId],
+        task: InFlightStoreTask,
+    ) -> None:
+        """State-transition dispatcher. Delegate to ``_finalize_store``
+        once the L2 outcome has been recorded by
+        ``_drain_l2_store_completions``."""
+        if task.l2_store_result is None:
+            return
+        self._finalize_store(task_key, task)
+
+    def _finalize_store(
+        self,
+        task_key: tuple[int, L2TaskId],
+        task: InFlightStoreTask,
+    ) -> None:
+        """Release read locks, publish completion, apply policy L1 deletions
+        on success, and remove the tracking entry."""
+        adapter_index, task_id = task_key
+        l1_mgr = self._l1_manager
+        success = task.l2_store_result
+
+        l1_mgr.finish_read(task.read_locked_keys)
+        del self._in_flight_tasks[task_key]
+        self._status_in_flight_count -= 1
+        self._reuse_in_flight.difference_update(task.keys)
+
+        l2_name = self._adapter_descriptors[adapter_index].type_name
+        completion_meta: dict[str, object] = {
+            "adapter_index": adapter_index,
+            "task_id": task_id,
+            "l2_name": l2_name,
+            "bytes_transferred": task.l2_bytes_transferred,
+        }
+        if success:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_STORE_COMPLETED,
+                    metadata={
+                        **completion_meta,
+                        "succeeded_count": len(task.keys),
+                        "failed_count": 0,
+                        "key_count_per_salt": Counter(k.cache_salt for k in task.keys),
+                    },
+                )
+            )
+            logger.debug(
+                "L2 store task %d completed: adapter %d, %d keys.",
+                task_id,
+                adapter_index,
+                len(task.keys),
+            )
+            if self._tracks_l2_residency:
+                self._remember_l2_resident(task.keys)
+            delete_keys = self._policy.select_l1_deletions(task.keys)
+            if delete_keys:
+                self._delete_from_l1(delete_keys)
+        else:
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.L2_STORE_COMPLETED,
+                    metadata={
+                        **completion_meta,
+                        "succeeded_count": 0,
+                        "failed_count": len(task.keys),
+                    },
+                )
+            )
+            logger.warning(
+                "Store task %d to adapter %d failed for keys: %s",
+                task_id,
+                adapter_index,
+                task.keys,
+            )
+
+    def _remember_l2_resident(self, keys: list[ObjectKey]) -> None:
+        """Record keys as present in L2, forgetting the oldest beyond the bound."""
+        for key in keys:
+            self._l2_resident[key] = None
+            self._l2_resident.move_to_end(key)
+        while len(self._l2_resident) > self._MAX_TRACKED_L2_KEYS:
+            self._l2_resident.popitem(last=False)
+
+    def _delete_from_l1(self, keys: list[ObjectKey]) -> None:
+        """Delete ``keys`` from L1 and defer the ones a reader still holds."""
+        for key, err in self._l1_manager.delete(keys).items():
+            if err == L1Error.KEY_IS_LOCKED:
+                self._deferred_l1_deletions.add(key)
+            else:
+                self._deferred_l1_deletions.discard(key)
+
+    def _retry_deferred_l1_deletions(self) -> None:
+        """Retry deferred L1 deletions at most once per poll interval."""
+        if not self._deferred_l1_deletions:
+            return
+        now = time.monotonic()
+        if now - self._last_l1_deletion_retry < STORE_LOOP_POLL_TIMEOUT_MS / 1000:
+            return
+        self._last_l1_deletion_retry = now
+        self._delete_from_l1(list(self._deferred_l1_deletions))
+
+    def _cleanup_in_flight_tasks(self) -> None:
+        """
+        Release all held read locks for any in-flight tasks that
+        haven't completed. Called during stop().
+        """
+        l1_mgr = self._l1_manager
+        for (adapter_index, task_id), task in self._in_flight_tasks.items():
+            logger.warning(
+                "Cleaning up in-flight store task %d (adapter %d, %d keys).",
+                task_id,
+                adapter_index,
+                len(task.read_locked_keys),
+            )
+            l1_mgr.finish_read(task.read_locked_keys)
+        self._in_flight_tasks.clear()
