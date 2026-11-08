@@ -1,0 +1,95 @@
+--- a/lmcache/integration/vllm/checkpoint_copy.py
++++ b/lmcache/integration/vllm/checkpoint_copy.py
+@@ -6,6 +6,7 @@
+ from typing import Any
+ import json
+ import threading
++import time
+ 
+ # Third Party
+ import torch
+@@ -65,6 +66,14 @@
+         self._capabilities = capabilities
+         self._stream = torch_dev.Stream(device=page_pool.device)
+         self._lock = threading.Lock()
++        # The DMA drain happens OUTSIDE the lock (event-based), so the next
++        # lease can enqueue its own burst while this one drains on the stream.
++        # Concurrency is bounded by the caller's executor (CheckpointTransfer
++        # Worker workers=2 default), not here. The inflight counter guards the
++        # remap path: it must never unmap pinned SHM bytes while a drain is
++        # still running.
++        self._inflight_cv = threading.Condition(self._lock)
++        self._inflight = 0
+ 
+     def __call__(
+         self, job: CheckpointTransferJob, lease: CheckpointLeaseResponse
+@@ -114,8 +123,9 @@
+         # another task's copies on the shared stream. No model-thread barrier.
+         # Views are borrowed under the same lock so a remap never runs while
+         # another copy still holds bytes of the old mapping.
++        done = None
+         with (
+-            self._lock,
++            self._inflight_cv,
+             torch_dev.device(self._pool.device),
+             torch_dev.stream(self._stream),
+         ):
+@@ -123,6 +133,25 @@
+                 # The LMCache server restarted and recreated its pool. This
+                 # lease may belong to either server, so it is not trusted; later
+                 # leases come from the new server and use the new mapping.
++                # Copies from earlier leases may still drain on the old
++                # mapping; wait them out (bounded) before remapping. If a drain
++                # is stuck past the deadline, remapping would unmap pinned SHM
++                # bytes under live DMA, so refuse and require worker
++                # termination instead.
++                deadline = time.monotonic() + 30.0
++                while self._inflight > 0 and time.monotonic() < deadline:
++                    self._inflight_cv.wait(timeout=1.0)
++                if self._inflight > 0:
++                    raise UnsafeCheckpointCopyError(
++                        "Checkpoint remap blocked by undrained copies; worker "
++                        "termination required before reclaiming buffers"
++                    )
++                if self._transfer.is_current():
++                    # Another worker already remapped while we waited; this
++                    # lease still belongs to the old mapping.
++                    raise ValueError(
++                        "LMCache replaced its checkpoint SHM pool; lease not trusted"
++                    )
+                 self._transfer.remap()
+                 raise ValueError(
+                     "LMCache replaced its checkpoint SHM pool; lease not trusted"
+@@ -145,10 +174,31 @@
+                             page.copy_(self._pool[block], non_blocking=True)
+                         else:
+                             self._pool[block].copy_(page, non_blocking=True)
+-            finally:
++                ev = torch_dev.Event()
++                ev.record(self._stream)
++                done = ev  # assigned only after a successful record
++                self._inflight += 1
++            except BaseException:
++                # Partial burst (or event/record failure): drain what was
++                # enqueued before unwinding, so the lease cannot be released
++                # under live DMA (legacy path).
+                 try:
+                     self._stream.synchronize()
+                 except BaseException as exc:
+                     raise UnsafeCheckpointCopyError(
+                         "Checkpoint DMA could not drain"
+                     ) from exc
++                raise
++        try:
++            # Drain outside the lock: the next lease enqueues its own burst
++            # while this burst's DMA runs on the stream. The call still
++            # guarantees "returned = drained".
++            done.synchronize()
++        except BaseException as exc:
++            raise UnsafeCheckpointCopyError(
++                "Checkpoint DMA could not drain"
++            ) from exc
++        finally:
++            with self._inflight_cv:
++                self._inflight -= 1
++                self._inflight_cv.notify_all()

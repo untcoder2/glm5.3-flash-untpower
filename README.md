@@ -62,6 +62,25 @@ offloading connector at request boundaries.
    → [docs/blend6228-chunk0-fingerprint.md](docs/blend6228-chunk0-fingerprint.md),
    [diff](diffs/20261106-blend6228-chunk0-fingerprint.diff)
 
+5. **Checkpoint-restore DMA drains outside the copy lock (LMCache 0.5.7+lil
+   `engine_driven`)** — warm-turn TTFT spikes of 9–13 s at cached_tokens≈99%:
+   restoring a ~130 K-token boundary checkpoint took 8–13 s while raw H2D
+   bandwidth is 28.8 GB/s (6.4 GB ≈ 0.25 s, ×38 overhead). `CheckpointPageCopier`
+   held `threading.Lock` across the whole enqueue burst + `stream.synchronize()`,
+   so the two executor workers copied strictly one lease at a time. Fix: record an
+   event after the enqueue and synchronize OUTSIDE the lock, so the next lease
+   enqueues while the previous burst drains on the stream; an in-flight counter
+   guards the remap path (refuses with `UnsafeCheckpointCopyError` while drains
+   are live instead of unmapping pinned SHM under DMA); partial bursts on the
+   exception path drain under the lock (legacy semantics); increment only after a
+   successful event record.
+   **Status: live in production since 08.11** (overlay image on the battle
+   engine; acceptance green). Live effect on the slow class is pending a
+   measurement under real multi-session load.
+   → [docs/kvfix-restore-pipeline.md](docs/kvfix-restore-pipeline.md),
+   [diff](diffs/20261108-kvfix-restore-drain.diff),
+   [file](files/lmcache/checkpoint_copy.py)
+
 ## Upstream
 
 - **[vllm#64312](https://github.com/vllm-project/vllm/pull/64312)** (merged 03.11)
